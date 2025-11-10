@@ -1,100 +1,46 @@
-# Speech to Action
+# Speech-to-Action
 
-這個專案包含兩個語音轉文字應用：
+macOS menubar app for voice-to-text with OpenAI Whisper API.
 
-## 📱 專案組成
+Press `⌃⌥R` anywhere to transcribe speech into focused app.
 
-### 1. Brainwave - Web 版語音轉文字工具
+## Demo
 
-基於 Web 的即時語音識別和摘要工具，使用 OpenAI Realtime API。
+## Quick Start
 
-- 📁 位置: `brainwave/`
-- 📖 文檔: [brainwave/README.md](brainwave/README.md)
-- ✨ 特色:
-  - 即時語音轉文字
-  - 智能摘要功能
-  - 多語言支持
-  - Web 界面
-
-### 2. macOS 狀態列應用 - 語音轉剪貼板
-
-macOS 原生狀態列應用，隨時可用的語音轉文字工具。
-
-- 📁 位置: `macos_menubar_app/`
-- 📖 文檔: [macos_menubar_app/README.md](macos_menubar_app/README.md)
-- ✨ 特色:
-  - 🎤 狀態列快速訪問
-  - 📋 自動複製到剪貼板
-  - ⌨️ 快捷鍵支持 (⌘R)
-  - 🌍 多語言支持
-  - 📝 歷史記錄
-
-## 🚀 快速開始
-
-### Brainwave (Web 版)
+Run the python in background:
 
 ```bash
-cd brainwave
-pip install -r requirements.txt
-export OPENAI_API_KEY='your-api-key'
-uvicorn realtime_server:app --host 0.0.0.0 --port 3005
-```
-
-訪問 http://localhost:3005
-
-### macOS 狀態列應用
-
-```bash
+git clone https://github.com/arealclimber/speech-to-action.git
 cd macos_menubar_app
-./install.sh
-./run.sh
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+export OPENAI_API_KEY='your-openai-api-key'
+python3 speech_to_clipboard.py
 ```
 
-## 📋 系統要求
+## Features
 
-### Brainwave
-- Python 3.8+
-- 現代瀏覽器
-- OpenAI API Key
+- **Global hotkey** (`⌃⌥R`) - Start/stop recording from anywhere
+- **Auto-paste** - Text appears in focused app automatically
+- **Multi-language** - Auto-detect or specify language
 
-### macOS 狀態列應用
+## Requirements
+
 - macOS 10.14+
 - Python 3.8+
-- OpenAI API Key
+- OpenAI API key from [platform.openai.com](https://platform.openai.com/api-keys)
 
-## 🛠️ 技術棧
+## Documentation
 
-### Brainwave
-- FastAPI
-- WebSocket
-- OpenAI Realtime API
-- Web Audio API
+- [README](macos_menubar_app/README.md) - Full documentation
+- [Quick Start](macos_menubar_app/QUICKSTART.md) - 2-minute setup guide
 
-### macOS 狀態列應用
-- rumps (macOS 狀態列框架)
-- OpenAI Whisper API
-- sounddevice (音頻錄製)
-- pyperclip (剪貼板操作)
+## Tech Stack
 
-## 📖 詳細文檔
-
-- [Brainwave 完整文檔](brainwave/README.md)
-- [macOS 應用完整文檔](macos_menubar_app/README.md)
-
-## 🤝 貢獻
-
-歡迎提交 Issue 和 Pull Request！
-
-## 📄 授權
-
-MIT License
-
-## 🙏 致謝
-
-- OpenAI Whisper & Realtime API
-- rumps - macOS 狀態列應用框架
-- FastAPI - 現代 Web 框架
-
----
-
-**2025 AI FUNkathon 專案**
+- OpenAI Whisper API (speech-to-text)
+- rumps (menubar framework)
+- sounddevice (audio recording)
+- pynput (global hotkey)
+- pyperclip (clipboard)
