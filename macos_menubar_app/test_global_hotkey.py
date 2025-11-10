@@ -14,7 +14,7 @@ print("Global Hotkey Test")
 print("=" * 60)
 
 # 測試快捷鍵組合
-hotkey_combo = '<ctrl>+<alt>+r'
+hotkey_combo = '<ctrl>+<alt>+a'
 press_count = 0
 
 def on_activate():
@@ -23,14 +23,14 @@ def on_activate():
     press_count += 1
     timestamp = time.strftime("%H:%M:%S")
     print(f"\n[{timestamp}] ✅ 快捷鍵被觸發！(第 {press_count} 次)")
-    print(f"    組合鍵: Control+Option+R")
+    print(f"    組合鍵: Control+Option+A")
 
     if press_count >= 3:
         print("\n✨ 測試完成！快捷鍵工作正常。")
         print("   按 Ctrl+C 退出測試")
 
 print(f"\n測試快捷鍵組合: {hotkey_combo}")
-print("映射為: Control+Option+R (⌃⌥R)")
+print("映射為: Control+Option+A (⌃⌥A)")
 print()
 print("請按快捷鍵測試...")
 print("(按 3 次快捷鍵後測試完成)")

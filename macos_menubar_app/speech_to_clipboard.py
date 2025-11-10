@@ -378,13 +378,13 @@ class SpeechToClipboardApp(rumps.App):
     def stop_recording(self):
         """停止錄音並轉換為文字"""
         self.recording = False
-        self.title = "🎤"  # 恢復狀態列圖示
         self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
         self.menu["錄音中..."].state = False
 
         logger.info("停止錄音，開始轉換...")
 
         if not self.audio_data:
+            self.title = "🎤"  # 恢復狀態列圖示
             rumps.notification(
                 "語音轉文字",
                 "未錄到音頻",
@@ -408,6 +408,9 @@ class SpeechToClipboardApp(rumps.App):
 
             logger.info(f"音頻已保存到: {temp_path}")
 
+            # 更改圖示為處理中
+            self.title = "🔄"
+
             # 使用 OpenAI Whisper API 轉換
             with open(temp_path, 'rb') as audio_file:
                 transcript = self.client.audio.transcriptions.create(
@@ -418,6 +421,9 @@ class SpeechToClipboardApp(rumps.App):
 
             text = transcript.text
             logger.info(f"轉換結果: {text}")
+
+            # 恢復圖示
+            self.title = "🎤"
 
             # 複製到剪貼板
             self.copy_to_clipboard(text)
@@ -452,6 +458,8 @@ class SpeechToClipboardApp(rumps.App):
 
         except Exception as e:
             logger.error(f"處理音頻錯誤: {e}")
+            # 恢復圖示
+            self.title = "🎤"
             rumps.notification(
                 "轉換錯誤",
                 "無法轉換語音為文字",
