@@ -52,7 +52,7 @@ class SpeechToClipboardApp(rumps.App):
     def __init__(self):
         super(SpeechToClipboardApp, self).__init__(
             "🎤",  # 狀態列圖示
-            title="語音轉文字",
+            title="STT",
             quit_button=None  # 自定義退出按鈕
         )
 
@@ -114,7 +114,7 @@ class SpeechToClipboardApp(rumps.App):
         options = {kAXTrustedCheckOptionPrompt: True}
         trusted = AXIsProcessTrustedWithOptions(options)
         if not trusted:
-            logger.warning("需要輔助功能權限才能自動粘貼")
+            logger.warning("Accessibility permission required for auto-paste")
         return trusted
 
     def setup_settings_menu(self):
@@ -141,7 +141,7 @@ class SpeechToClipboardApp(rumps.App):
                 )
         else:
             sender.title = "自動粘貼到焦點應用"
-        logger.info(f"自動粘貼: {'開啟' if self.auto_paste_enabled else '關閉'}")
+        logger.info(f"Auto-paste: {'Enabled' if self.auto_paste_enabled else 'Disabled'}")
 
     def toggle_global_hotkey(self, sender):
         """切換全局快捷鍵功能"""
@@ -149,11 +149,11 @@ class SpeechToClipboardApp(rumps.App):
         if self.global_hotkey_enabled:
             sender.title = "✓ 全局快捷鍵 (⌃⌥A)"
             self.start_global_hotkey_listener()
-            logger.info("全局快捷鍵已開啟")
+            logger.info("Global hotkey enabled")
         else:
             sender.title = "全局快捷鍵 (⌃⌥A)"
             self.stop_global_hotkey_listener()
-            logger.info("全局快捷鍵已關閉")
+            logger.info("Global hotkey disabled")
 
     def start_global_hotkey_listener(self):
         """啟動全局快捷鍵監聽"""
@@ -178,10 +178,10 @@ class SpeechToClipboardApp(rumps.App):
 
             # 啟動監聽器（在後台線程運行）
             self.hotkey_listener.start()
-            logger.info("全局快捷鍵監聽器已啟動 (Control+Option+A)")
+            logger.info("Global hotkey listener started (Control+Option+A)")
 
         except Exception as e:
-            logger.error(f"啟動全局快捷鍵監聽器失敗: {e}")
+            logger.error(f"Failed to start global hotkey listener: {e}")
             rumps.notification(
                 "快捷鍵錯誤",
                 "無法啟動全局快捷鍵",
@@ -194,13 +194,13 @@ class SpeechToClipboardApp(rumps.App):
             try:
                 self.hotkey_listener.stop()
                 self.hotkey_listener = None
-                logger.info("全局快捷鍵監聽器已停止")
+                logger.info("Global hotkey listener stopped")
             except Exception as e:
-                logger.error(f"停止全局快捷鍵監聽器失敗: {e}")
+                logger.error(f"Failed to stop global hotkey listener: {e}")
 
     def on_hotkey_pressed(self):
         """全局快捷鍵被按下的回調"""
-        logger.info("全局快捷鍵被按下 (Control+Option+A)")
+        logger.info("Global hotkey pressed (Control+Option+A)")
         # 切換錄音狀態
         self.toggle_recording(None)
 
@@ -236,7 +236,7 @@ class SpeechToClipboardApp(rumps.App):
                     'bundle_id': bundle_id
                 }
         except Exception as e:
-            logger.error(f"獲取焦點應用失敗: {e}")
+            logger.error(f"Failed to get focused app: {e}")
         return None
 
     def simulate_command_v(self):
@@ -269,21 +269,21 @@ class SpeechToClipboardApp(rumps.App):
             time.sleep(0.01)
             CGEventPost(kCGHIDEventTap, cmd_up)
 
-            logger.info("已模擬 Command+V")
+            logger.info("Simulated Command+V")
             return True
         except Exception as e:
-            logger.error(f"模擬按鍵失敗: {e}")
+            logger.error(f"Failed to simulate key press: {e}")
             return False
 
     def auto_paste_to_focused_app(self, text):
         """自動粘貼文字到焦點應用"""
         if not self.auto_paste_enabled:
-            logger.info("自動粘貼已關閉")
+            logger.info("Auto-paste disabled")
             return False
 
         # 檢查權限
         if not AXIsProcessTrustedWithOptions(None):
-            logger.warning("沒有輔助功能權限，無法自動粘貼")
+            logger.warning("No accessibility permission, cannot auto-paste")
             return False
 
         try:
@@ -291,7 +291,7 @@ class SpeechToClipboardApp(rumps.App):
             app_info = self.get_focused_app_info()
             if app_info:
                 app_name = app_info['name']
-                logger.info(f"目標應用: {app_name}")
+                logger.info(f"Target app: {app_name}")
 
                 # 先確保文字在剪貼板中
                 pyperclip.copy(text)
@@ -299,14 +299,14 @@ class SpeechToClipboardApp(rumps.App):
 
                 # 模擬 Command+V
                 if self.simulate_command_v():
-                    logger.info(f"已自動粘貼到 {app_name}")
+                    logger.info(f"Auto-pasted to {app_name}")
                     return True
             else:
-                logger.warning("無法獲取焦點應用")
+                logger.warning("Cannot get focused app")
                 return False
 
         except Exception as e:
-            logger.error(f"自動粘貼失敗: {e}")
+            logger.error(f"Auto-paste failed: {e}")
             return False
 
     def update_recent_results_menu(self):
@@ -342,7 +342,7 @@ class SpeechToClipboardApp(rumps.App):
         self.menu["開始錄音 (⌃⌥A)"].title = "停止錄音 (⌃⌥A)"
         self.menu["錄音中..."].state = True
 
-        logger.info("開始錄音...")
+        logger.info("Recording started...")
 
         # 在新線程中錄音
         threading.Thread(target=self._record_audio, daemon=True).start()
@@ -351,7 +351,7 @@ class SpeechToClipboardApp(rumps.App):
         """錄音線程"""
         def audio_callback(indata, frames, time, status):
             if status:
-                logger.warning(f"錄音狀態: {status}")
+                logger.warning(f"Recording status: {status}")
             self.audio_queue.put(indata.copy())
 
         try:
@@ -368,7 +368,7 @@ class SpeechToClipboardApp(rumps.App):
                     except queue.Empty:
                         continue
         except Exception as e:
-            logger.error(f"錄音錯誤: {e}")
+            logger.error(f"Recording error: {e}")
             rumps.notification(
                 "錄音錯誤",
                 "無法訪問麥克風",
@@ -381,7 +381,7 @@ class SpeechToClipboardApp(rumps.App):
         self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
         self.menu["錄音中..."].state = False
 
-        logger.info("停止錄音，開始轉換...")
+        logger.info("Recording stopped, starting transcription...")
 
         if not self.audio_data:
             self.title = "🎤"  # 恢復狀態列圖示
@@ -406,7 +406,7 @@ class SpeechToClipboardApp(rumps.App):
                 temp_path = temp_file.name
                 wavfile.write(temp_path, self.sample_rate, audio_array)
 
-            logger.info(f"音頻已保存到: {temp_path}")
+            logger.info(f"Audio saved to: {temp_path}")
 
             # 更改圖示為處理中
             self.title = "🔄"
@@ -420,7 +420,7 @@ class SpeechToClipboardApp(rumps.App):
                 )
 
             text = transcript.text
-            logger.info(f"轉換結果: {text}")
+            logger.info(f"Transcription result: {text}")
 
             # 恢復圖示
             self.title = "🎤"
@@ -457,7 +457,7 @@ class SpeechToClipboardApp(rumps.App):
             os.unlink(temp_path)
 
         except Exception as e:
-            logger.error(f"處理音頻錯誤: {e}")
+            logger.error(f"Audio processing error: {e}")
             # 恢復圖示
             self.title = "🎤"
             rumps.notification(
@@ -470,9 +470,9 @@ class SpeechToClipboardApp(rumps.App):
         """複製文字到剪貼板"""
         try:
             pyperclip.copy(text)
-            logger.info("已複製到剪貼板")
+            logger.info("Copied to clipboard")
         except Exception as e:
-            logger.error(f"複製到剪貼板失敗: {e}")
+            logger.error(f"Failed to copy to clipboard: {e}")
 
     @rumps.clicked("關於")
     def about(self, _):
@@ -495,7 +495,7 @@ class SpeechToClipboardApp(rumps.App):
         """退出應用"""
         # 停止全局快捷鍵監聽器
         self.stop_global_hotkey_listener()
-        logger.info("應用正在退出...")
+        logger.info("Application quitting...")
         rumps.quit_application()
 
 

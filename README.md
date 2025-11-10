@@ -1,4 +1,5 @@
 # Speech-to-Action
+(speech to paste)
 
 macOS menubar app for voice-to-text with OpenAI Whisper API.
 
