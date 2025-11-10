@@ -2,14 +2,11 @@
 
 macOS menubar app for voice-to-text with OpenAI Whisper API.
 
-Press `⌃⌥R` (control+option+R) anywhere to transcribe speech into focused app.
+Press `⌃⌥A` (control+option+A) anywhere to transcribe speech into focused app.
 
 ## Demo
 
-
 https://github.com/user-attachments/assets/cab96181-7ffc-4e46-8d93-d72c902a2233
-
-
 
 ## Quick Start
 
@@ -27,7 +24,7 @@ python3 speech_to_clipboard.py
 
 ## Features
 
-- **Global hotkey** (`⌃⌥R`) - Start/stop recording from anywhere
+- **Global hotkey** - Start/stop recording from anywhere
 - **Auto-paste** - Text appears in focused app automatically
 - **Multi-language** - Auto-detect or specify language
 

@@ -31,15 +31,15 @@ python3 speech_to_clipboard.py
 2. **Look for 🎤** in menubar (top right)
 
 3. **Test it**:
-   - Press `⌃⌥R` anywhere
+   - Press `⌃⌥A` anywhere
    - Speak into microphone
-   - Press `⌃⌥R` to stop
+   - Press `⌃⌥A` to stop
    - Text appears in focused app
 
 ### Terminal Commands
 
 1. Focus Terminal
-2. Press `⌃⌥R` → speak command → `⌃⌥R`
+2. Press `⌃⌥A` → speak command → `⌃⌥A`
 3. Command appears in terminal
 
 ## Troubleshooting
