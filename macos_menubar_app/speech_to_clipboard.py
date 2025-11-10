@@ -73,7 +73,7 @@ class SpeechToClipboardApp(rumps.App):
 
         # 設置菜單
         self.menu = [
-            rumps.MenuItem("開始錄音 (⌃⌥R)", callback=self.toggle_recording, key="r"),
+            rumps.MenuItem("開始錄音 (⌃⌥A)", callback=self.toggle_recording, key="a"),
             rumps.separator,
             rumps.MenuItem("錄音中...", callback=None),
             rumps.separator,
@@ -122,7 +122,7 @@ class SpeechToClipboardApp(rumps.App):
         settings_menu = [
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
-            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥R)", callback=self.toggle_global_hotkey),
+            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥A)", callback=self.toggle_global_hotkey),
             rumps.MenuItem("模型: whisper-1", callback=None),
         ]
         self.menu["設定"] = settings_menu
@@ -147,11 +147,11 @@ class SpeechToClipboardApp(rumps.App):
         """切換全局快捷鍵功能"""
         self.global_hotkey_enabled = not self.global_hotkey_enabled
         if self.global_hotkey_enabled:
-            sender.title = "✓ 全局快捷鍵 (⌃⌥R)"
+            sender.title = "✓ 全局快捷鍵 (⌃⌥A)"
             self.start_global_hotkey_listener()
             logger.info("全局快捷鍵已開啟")
         else:
-            sender.title = "全局快捷鍵 (⌃⌥R)"
+            sender.title = "全局快捷鍵 (⌃⌥A)"
             self.stop_global_hotkey_listener()
             logger.info("全局快捷鍵已關閉")
 
@@ -164,9 +164,9 @@ class SpeechToClipboardApp(rumps.App):
         self.stop_global_hotkey_listener()
 
         try:
-            # 定義快捷鍵組合：Control + Option + R
+            # 定義快捷鍵組合：Control + Option + A
             hotkey_combination = keyboard.HotKey(
-                keyboard.HotKey.parse('<ctrl>+<alt>+r'),
+                keyboard.HotKey.parse('<ctrl>+<alt>+a'),
                 self.on_hotkey_pressed
             )
 
@@ -178,7 +178,7 @@ class SpeechToClipboardApp(rumps.App):
 
             # 啟動監聽器（在後台線程運行）
             self.hotkey_listener.start()
-            logger.info("全局快捷鍵監聽器已啟動 (Control+Option+R)")
+            logger.info("全局快捷鍵監聽器已啟動 (Control+Option+A)")
 
         except Exception as e:
             logger.error(f"啟動全局快捷鍵監聽器失敗: {e}")
@@ -200,7 +200,7 @@ class SpeechToClipboardApp(rumps.App):
 
     def on_hotkey_pressed(self):
         """全局快捷鍵被按下的回調"""
-        logger.info("全局快捷鍵被按下 (Control+Option+R)")
+        logger.info("全局快捷鍵被按下 (Control+Option+A)")
         # 切換錄音狀態
         self.toggle_recording(None)
 
@@ -339,7 +339,7 @@ class SpeechToClipboardApp(rumps.App):
         self.recording = True
         self.audio_data = []
         self.title = "🔴"  # 改變狀態列圖示為紅點
-        self.menu["開始錄音 (⌃⌥R)"].title = "停止錄音 (⌃⌥R)"
+        self.menu["開始錄音 (⌃⌥A)"].title = "停止錄音 (⌃⌥A)"
         self.menu["錄音中..."].state = True
 
         logger.info("開始錄音...")
@@ -379,7 +379,7 @@ class SpeechToClipboardApp(rumps.App):
         """停止錄音並轉換為文字"""
         self.recording = False
         self.title = "🎤"  # 恢復狀態列圖示
-        self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
+        self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
         self.menu["錄音中..."].state = False
 
         logger.info("停止錄音，開始轉換...")
@@ -474,8 +474,8 @@ class SpeechToClipboardApp(rumps.App):
             "一個簡單的 macOS 狀態列應用\n"
             "使用 OpenAI Whisper API 進行語音識別\n\n"
             "快捷鍵:\n"
-            "  ⌃⌥R - 全局快捷鍵（隨時可用）\n"
-            "  ⌘R - 菜單快捷鍵（需打開菜單）\n\n"
+            "  ⌃⌥A - 全局快捷鍵（隨時可用）\n"
+            "  ⌘A - 菜單快捷鍵（需打開菜單）\n\n"
             "功能:\n"
             "  • 語音轉文字\n"
             "  • 自動粘貼到焦點應用\n"
