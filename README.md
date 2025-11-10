@@ -2,9 +2,14 @@
 
 macOS menubar app for voice-to-text with OpenAI Whisper API.
 
-Press `⌃⌥R` anywhere to transcribe speech into focused app.
+Press `⌃⌥R` (control+option+R) anywhere to transcribe speech into focused app.
 
 ## Demo
+
+
+https://github.com/user-attachments/assets/cab96181-7ffc-4e46-8d93-d72c902a2233
+
+
 
 ## Quick Start
 
