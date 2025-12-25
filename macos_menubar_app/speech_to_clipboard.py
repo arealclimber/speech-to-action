@@ -68,8 +68,10 @@ class SpeechToClipboardApp(rumps.App):
         self.sample_rate = 16000  # Whisper 推薦 16kHz
         self.channels = 1
         self.recording = False
+        self.processing = False  # 新增：標記是否正在處理音頻
         self.audio_queue = queue.Queue()
         self.audio_data = []
+        self.audio_lock = threading.Lock()  # 新增：保護 audio_data
 
         # 設置菜單
         self.menu = [
@@ -329,6 +331,16 @@ class SpeechToClipboardApp(rumps.App):
 
     def toggle_recording(self, sender):
         """切換錄音狀態"""
+        # 如果正在處理音頻，忽略請求
+        if self.processing:
+            logger.warning("Still processing previous recording, please wait...")
+            rumps.notification(
+                "請稍候",
+                "正在處理上一段錄音",
+                "請等待處理完成後再開始新錄音"
+            )
+            return
+        
         if not self.recording:
             self.start_recording()
         else:
@@ -337,7 +349,18 @@ class SpeechToClipboardApp(rumps.App):
     def start_recording(self):
         """開始錄音"""
         self.recording = True
-        self.audio_data = []
+        
+        # 清空之前的音頻數據和隊列
+        with self.audio_lock:
+            self.audio_data = []
+        
+        # 清空 audio_queue 中的殘留數據
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        
         self.title = "🔴"  # 改變狀態列圖示為紅點
         self.menu["開始錄音 (⌃⌥A)"].title = "停止錄音 (⌃⌥A)"
         self.menu["錄音中..."].state = True
@@ -352,7 +375,9 @@ class SpeechToClipboardApp(rumps.App):
         def audio_callback(indata, frames, time, status):
             if status:
                 logger.warning(f"Recording status: {status}")
-            self.audio_queue.put(indata.copy())
+            # 只有在錄音狀態時才將數據放入隊列
+            if self.recording:
+                self.audio_queue.put(indata.copy())
 
         try:
             with sd.InputStream(
@@ -364,9 +389,22 @@ class SpeechToClipboardApp(rumps.App):
                 while self.recording:
                     try:
                         data = self.audio_queue.get(timeout=0.1)
-                        self.audio_data.append(data)
+                        with self.audio_lock:
+                            self.audio_data.append(data)
                     except queue.Empty:
                         continue
+            
+            # 錄音結束後，處理隊列中剩餘的數據
+            while not self.audio_queue.empty():
+                try:
+                    data = self.audio_queue.get_nowait()
+                    with self.audio_lock:
+                        self.audio_data.append(data)
+                except queue.Empty:
+                    break
+                    
+            logger.info(f"Recording thread ended, collected {len(self.audio_data)} audio chunks")
+            
         except Exception as e:
             logger.error(f"Recording error: {e}")
             rumps.notification(
@@ -378,13 +416,26 @@ class SpeechToClipboardApp(rumps.App):
     def stop_recording(self):
         """停止錄音並轉換為文字"""
         self.recording = False
-        self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
+        self.processing = True  # 標記開始處理
+        self.title = "🔄"  # 立即顯示處理中圖標
+        self.menu["開始錄音 (⌃⌥A)"].title = "處理中..."
         self.menu["錄音中..."].state = False
 
-        logger.info("Recording stopped, starting transcription...")
+        logger.info("Recording stopped, waiting for audio thread to finish...")
 
-        if not self.audio_data:
+        # 給錄音線程一點時間來收集剩餘數據
+        time.sleep(0.2)
+
+        # 使用鎖安全地複製音頻數據
+        with self.audio_lock:
+            audio_data_copy = list(self.audio_data)
+        
+        logger.info(f"Collected {len(audio_data_copy)} audio chunks, starting transcription...")
+
+        if not audio_data_copy:
             self.title = "🎤"  # 恢復狀態列圖示
+            self.processing = False
+            self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
             rumps.notification(
                 "語音轉文字",
                 "未錄到音頻",
@@ -392,14 +443,25 @@ class SpeechToClipboardApp(rumps.App):
             )
             return
 
-        # 在新線程中處理音頻
-        threading.Thread(target=self._process_audio, daemon=True).start()
+        # 在新線程中處理音頻，傳入複製的數據
+        threading.Thread(target=self._process_audio, args=(audio_data_copy,), daemon=True).start()
 
-    def _process_audio(self):
-        """處理音頻並轉換為文字"""
+    def _process_audio(self, audio_data_copy):
+        """處理音頻並轉換為文字
+        
+        Args:
+            audio_data_copy: 音頻數據的副本，避免競爭條件
+        """
+        temp_path = None
         try:
+            logger.info(f"Processing {len(audio_data_copy)} audio chunks...")
+            
             # 合併音頻數據
-            audio_array = np.concatenate(self.audio_data, axis=0)
+            if not audio_data_copy:
+                raise ValueError("No audio data to process")
+            
+            audio_array = np.concatenate(audio_data_copy, axis=0)
+            logger.info(f"Audio array shape: {audio_array.shape}, duration: {len(audio_array)/self.sample_rate:.2f}s")
 
             # 保存為臨時 WAV 文件
             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
@@ -408,10 +470,8 @@ class SpeechToClipboardApp(rumps.App):
 
             logger.info(f"Audio saved to: {temp_path}")
 
-            # 更改圖示為處理中
-            self.title = "🔄"
-
             # 使用 OpenAI Whisper API 轉換
+            logger.info("Calling OpenAI Whisper API...")
             with open(temp_path, 'rb') as audio_file:
                 transcript = self.client.audio.transcriptions.create(
                     model="whisper-1",
@@ -422,8 +482,9 @@ class SpeechToClipboardApp(rumps.App):
             text = transcript.text
             logger.info(f"Transcription result: {text}")
 
-            # 恢復圖示
+            # 恢復圖示和狀態
             self.title = "🎤"
+            self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
 
             # 複製到剪貼板
             self.copy_to_clipboard(text)
@@ -453,18 +514,27 @@ class SpeechToClipboardApp(rumps.App):
                     text[:100] + "..." if len(text) > 100 else text
                 )
 
-            # 清理臨時文件
-            os.unlink(temp_path)
-
         except Exception as e:
-            logger.error(f"Audio processing error: {e}")
-            # 恢復圖示
+            logger.error(f"Audio processing error: {e}", exc_info=True)
+            # 恢復圖示和狀態
             self.title = "🎤"
+            self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
             rumps.notification(
                 "轉換錯誤",
                 "無法轉換語音為文字",
-                str(e)
+                str(e)[:100]
             )
+        finally:
+            # 確保 processing 標誌被重置
+            self.processing = False
+            logger.info("Processing completed, ready for next recording")
+            
+            # 清理臨時文件
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception as e:
+                    logger.warning(f"Failed to delete temp file: {e}")
 
     def copy_to_clipboard(self, text):
         """複製文字到剪貼板"""
