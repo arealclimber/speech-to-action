@@ -16,6 +16,30 @@ import pyperclip
 from scipy.io import wavfile
 import tempfile
 import logging
+from opencc import OpenCC
+
+# 將不常用的繁體字改成常用的（來自 clip2trad-python）
+MANUAL_MAPPINGS = {
+    '瞭解': '了解',
+    '羣': '群',
+    '臺': '台',
+    '峯': '峰',
+    '喫': '吃',
+    '纔': '才',
+}
+
+
+def apply_manual_mappings(text, mappings):
+    """
+    根據手動映射字典替換文本中的指定詞彙。
+
+    :param text: 要處理的文本
+    :param mappings: 替換映射字典
+    :return: 替換後的文本
+    """
+    for key, value in mappings.items():
+        text = text.replace(key, value)
+    return text
 
 # macOS Accessibility 和按鍵模擬
 from AppKit import NSWorkspace
@@ -63,6 +87,9 @@ class SpeechToClipboardApp(rumps.App):
             raise ValueError("OPENAI_API_KEY not set")
 
         self.client = OpenAI(api_key=api_key)
+
+        # 初始化簡繁轉換器（簡體轉繁體）
+        self.cc = OpenCC('s2t')
 
         # 錄音參數
         self.sample_rate = 16000  # Whisper 推薦 16kHz
@@ -125,7 +152,7 @@ class SpeechToClipboardApp(rumps.App):
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
             rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥A)", callback=self.toggle_global_hotkey),
-            rumps.MenuItem("模型: whisper-1", callback=None),
+            rumps.MenuItem("模型: gpt-4o-mini-transcribe", callback=None),
         ]
         self.menu["設定"] = settings_menu
 
@@ -474,13 +501,19 @@ class SpeechToClipboardApp(rumps.App):
             logger.info("Calling OpenAI Whisper API...")
             with open(temp_path, 'rb') as audio_file:
                 transcript = self.client.audio.transcriptions.create(
-                    model="whisper-1",
+                    model="gpt-4o-mini-transcribe",
                     file=audio_file,
                     language=getattr(self, 'language', None)  # 可選語言參數
                 )
 
             text = transcript.text
-            logger.info(f"Transcription result: {text}")
+            logger.info(f"Transcription result (original): {text}")
+            
+            # 將簡體中文轉換為繁體中文
+            text = self.cc.convert(text)
+            # 將不常用的繁體字改成常用的
+            text = apply_manual_mappings(text, MANUAL_MAPPINGS)
+            logger.info(f"Transcription result (traditional): {text}")
 
             # 恢復圖示和狀態
             self.title = "🎤"
