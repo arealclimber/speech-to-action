@@ -99,6 +99,7 @@ class SpeechToClipboardApp(rumps.App):
         self.audio_queue = queue.Queue()
         self.audio_data = []
         self.audio_lock = threading.Lock()  # 新增：保護 audio_data
+        self.recording_thread = None 
 
         # 設置菜單
         self.menu = [
@@ -375,6 +376,12 @@ class SpeechToClipboardApp(rumps.App):
 
     def start_recording(self):
         """開始錄音"""
+        if self.recording_thread and self.recording_thread.is_alive():
+            logger.warning("Previous recording thread still running, waiting for it to finish...")
+            self.recording_thread.join(timeout=1.0)
+            if self.recording_thread.is_alive():
+                logger.error("Previous recording thread did not finish in time")
+        
         self.recording = True
         
         # 清空之前的音頻數據和隊列
@@ -394,8 +401,8 @@ class SpeechToClipboardApp(rumps.App):
 
         logger.info("Recording started...")
 
-        # 在新線程中錄音
-        threading.Thread(target=self._record_audio, daemon=True).start()
+        self.recording_thread = threading.Thread(target=self._record_audio, daemon=True)
+        self.recording_thread.start()
 
     def _record_audio(self):
         """錄音線程"""
@@ -404,14 +411,18 @@ class SpeechToClipboardApp(rumps.App):
                 logger.warning(f"Recording status: {status}")
             # 只有在錄音狀態時才將數據放入隊列
             if self.recording:
-                self.audio_queue.put(indata.copy())
+                try:
+                    self.audio_queue.put_nowait(indata.copy())
+                except queue.Full:
+                    logger.warning("Audio queue full, dropping audio chunk")
 
         try:
             with sd.InputStream(
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 callback=audio_callback,
-                dtype=np.int16
+                dtype=np.int16,
+                blocksize=1024
             ):
                 while self.recording:
                     try:
@@ -419,21 +430,40 @@ class SpeechToClipboardApp(rumps.App):
                         with self.audio_lock:
                             self.audio_data.append(data)
                     except queue.Empty:
+                        if not self.recording:
+                            break
                         continue
-            
-            # 錄音結束後，處理隊列中剩餘的數據
+                
+                end_time = time.time() + 1.0
+                while time.time() < end_time:
+                    try:
+                        data = self.audio_queue.get(timeout=0.1)
+                        with self.audio_lock:
+                            self.audio_data.append(data)
+                    except queue.Empty:
+                        if self.audio_queue.empty():
+                            break
+                        continue
+                    
+            remaining_count = 0
             while not self.audio_queue.empty():
                 try:
                     data = self.audio_queue.get_nowait()
                     with self.audio_lock:
                         self.audio_data.append(data)
+                    remaining_count += 1
                 except queue.Empty:
                     break
+            
+            if remaining_count > 0:
+                logger.info(f"Processed {remaining_count} remaining audio chunks after stream closed")
                     
-            logger.info(f"Recording thread ended, collected {len(self.audio_data)} audio chunks")
+            with self.audio_lock:
+                total_chunks = len(self.audio_data)
+            logger.info(f"Recording thread ended, collected {total_chunks} audio chunks")
             
         except Exception as e:
-            logger.error(f"Recording error: {e}")
+            logger.error(f"Recording error: {e}", exc_info=True)
             rumps.notification(
                 "錄音錯誤",
                 "無法訪問麥克風",
@@ -450,10 +480,15 @@ class SpeechToClipboardApp(rumps.App):
 
         logger.info("Recording stopped, waiting for audio thread to finish...")
 
-        # 給錄音線程一點時間來收集剩餘數據
-        time.sleep(0.2)
+        if self.recording_thread and self.recording_thread.is_alive():
+            self.recording_thread.join(timeout=2.0)
+            if self.recording_thread.is_alive():
+                logger.warning("Recording thread did not finish in time, proceeding anyway")
+            else:
+                logger.info("Recording thread finished successfully")
+        
+        time.sleep(0.1)
 
-        # 使用鎖安全地複製音頻數據
         with self.audio_lock:
             audio_data_copy = list(self.audio_data)
         
