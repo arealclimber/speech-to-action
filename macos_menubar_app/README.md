@@ -12,12 +12,21 @@ source venv/bin/activate
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Set API key
+# 3. Set API key (choose one)
+
+# Option A: OpenAI Whisper
 export OPENAI_API_KEY='your-openai-api-key'
+
+# Option B: AI Builder transcription (add to ~/.zshrc to persist)
+export AI_BUILDER_API_KEY='your-ai-builder-api-key'
+# Or add to ~/.zshrc:
+#   export AI_BUILDER_API_KEY='your-ai-builder-api-key'
 
 # 4. Run app
 python3 speech_to_clipboard.py
 ```
+
+If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app uses **AI Builder** transcription (`https://space.ai-builders.com/backend/v1/audio/transcriptions`); otherwise it uses **OpenAI** Whisper.
 
 ## First Use
 
@@ -52,7 +61,7 @@ python3 speech_to_clipboard.py
 
 **No menubar icon?**
 
-- Check `OPENAI_API_KEY` is set
+- Set at least one of `OPENAI_API_KEY` or `AI_BUILDER_API_KEY` (e.g. in `~/.zshrc`)
 - Run `python3 speech_to_clipboard.py` in terminal to see errors
 
 **Recording doesn't start?**

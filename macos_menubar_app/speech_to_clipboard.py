@@ -4,6 +4,10 @@ macOS 狀態列語音轉文字應用
 Speech-to-Text macOS Menubar App
 """
 
+import json
+import re
+import urllib.request
+import urllib.error
 import rumps
 import sounddevice as sd
 import numpy as np
@@ -40,6 +44,36 @@ def apply_manual_mappings(text, mappings):
     for key, value in mappings.items():
         text = text.replace(key, value)
     return text
+
+
+def get_ai_builder_api_key():
+    """
+    取得 AI_BUILDER_API_KEY：先檢查環境變數，若無則從 ~/.zshrc 解析。
+    若 ~/.zshrc 中有 export AI_BUILDER_API_KEY=... 或 AI_BUILDER_API_KEY=...，則回傳其值。
+    """
+    key = os.environ.get("AI_BUILDER_API_KEY")
+    if key and key.strip():
+        return key.strip()
+
+    zshrc = os.path.expanduser("~/.zshrc")
+    if not os.path.isfile(zshrc):
+        return None
+
+    # 匹配 export AI_BUILDER_API_KEY=value 或 AI_BUILDER_API_KEY=value
+    pattern = re.compile(
+        r"^\s*(?:export\s+)?AI_BUILDER_API_KEY\s*=\s*(?:(['\"])(.*?)\1|(\S+))\s*(?:#.*)?$",
+        re.MULTILINE,
+    )
+    try:
+        with open(zshrc, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        m = pattern.search(content)
+        if m:
+            value = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+            return value.strip() if value else None
+    except OSError:
+        pass
+    return None
 
 # macOS Accessibility 和按鍵模擬
 from AppKit import NSWorkspace
@@ -80,13 +114,22 @@ class SpeechToClipboardApp(rumps.App):
             quit_button=None  # 自定義退出按鈕
         )
 
-        # 初始化 OpenAI 客戶端
-        api_key = os.getenv('OPENAI_API_KEY')
-        if not api_key:
-            rumps.alert("錯誤", "請設置 OPENAI_API_KEY 環境變量")
-            raise ValueError("OPENAI_API_KEY not set")
-
-        self.client = OpenAI(api_key=api_key)
+        # 選擇轉錄後端：若有 AI_BUILDER_API_KEY（環境變數或 ~/.zshrc）則用 AI Builder，否則用 OpenAI
+        ai_builder_key = get_ai_builder_api_key()
+        if ai_builder_key:
+            self.use_ai_builder = True
+            self.ai_builder_api_key = ai_builder_key
+            self.ai_builder_base = "https://space.ai-builders.com/backend"
+            self.client = None
+            logger.info("Using AI Builder transcription: %s", self.ai_builder_base)
+        else:
+            self.use_ai_builder = False
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                rumps.alert("錯誤", "請設置 OPENAI_API_KEY 或 AI_BUILDER_API_KEY（可寫入 ~/.zshrc）")
+                raise ValueError("OPENAI_API_KEY or AI_BUILDER_API_KEY not set")
+            self.client = OpenAI(api_key=api_key)
+            logger.info("Using OpenAI transcription")
 
         # 初始化簡繁轉換器（簡體轉繁體）
         self.cc = OpenCC('s2t')
@@ -149,11 +192,12 @@ class SpeechToClipboardApp(rumps.App):
 
     def setup_settings_menu(self):
         """設置設定子菜單"""
+        model_label = "模型: AI Builder 轉錄" if self.use_ai_builder else "模型: gpt-4o-mini-transcribe"
         settings_menu = [
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
             rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥A)", callback=self.toggle_global_hotkey),
-            rumps.MenuItem("模型: gpt-4o-mini-transcribe", callback=None),
+            rumps.MenuItem(model_label, callback=None),
         ]
         self.menu["設定"] = settings_menu
 
@@ -532,16 +576,44 @@ class SpeechToClipboardApp(rumps.App):
 
             logger.info(f"Audio saved to: {temp_path}")
 
-            # 使用 OpenAI Whisper API 轉換
-            logger.info("Calling OpenAI Whisper API...")
-            with open(temp_path, 'rb') as audio_file:
-                transcript = self.client.audio.transcriptions.create(
-                    model="gpt-4o-mini-transcribe",
-                    file=audio_file,
-                    language=getattr(self, 'language', None)  # 可選語言參數
+            if self.use_ai_builder:
+                # 使用 AI Builder 轉錄 API（標準庫 urllib，無需 requests）
+                url = f"{self.ai_builder_base}/v1/audio/transcriptions"
+                lang = getattr(self, "language", None)
+                boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
+                with open(temp_path, "rb") as audio_file:
+                    audio_bytes = audio_file.read()
+                body = (
+                    f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="audio_file"; filename="audio.wav"\r\n'
+                    "Content-Type: audio/wav\r\n\r\n"
+                ).encode("utf-8") + audio_bytes
+                if lang:
+                    body += f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{lang}\r\n".encode("utf-8")
+                body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    method="POST",
+                    headers={
+                        "Authorization": f"Bearer {self.ai_builder_api_key}",
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    },
                 )
-
-            text = transcript.text
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    result = json.loads(resp.read().decode())
+                text = result.get("text", "").strip()
+                logger.info("AI Builder transcription result (original): %s", text)
+            else:
+                # 使用 OpenAI Whisper API 轉換
+                logger.info("Calling OpenAI Whisper API...")
+                with open(temp_path, "rb") as audio_file:
+                    transcript = self.client.audio.transcriptions.create(
+                        model="gpt-4o-mini-transcribe",
+                        file=audio_file,
+                        language=getattr(self, "language", None),
+                    )
+                text = transcript.text
             logger.info(f"Transcription result (original): {text}")
             
             # 將簡體中文轉換為繁體中文
@@ -639,10 +711,11 @@ class SpeechToClipboardApp(rumps.App):
 
 def main():
     """主函數"""
-    # 檢查是否設置了 API key
-    if not os.getenv('OPENAI_API_KEY'):
-        print("錯誤: 請設置 OPENAI_API_KEY 環境變量")
-        print("使用方法: export OPENAI_API_KEY='your-api-key'")
+    # 至少需要 OPENAI_API_KEY 或 AI_BUILDER_API_KEY（可寫在 ~/.zshrc）
+    if not get_ai_builder_api_key() and not os.getenv("OPENAI_API_KEY"):
+        print("錯誤: 請設置 OPENAI_API_KEY 或 AI_BUILDER_API_KEY")
+        print("  OpenAI: export OPENAI_API_KEY='your-api-key'")
+        print("  AI Builder: 在 ~/.zshrc 加入 export AI_BUILDER_API_KEY='your-key'")
         return
 
     app = SpeechToClipboardApp()
