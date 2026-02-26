@@ -51,6 +51,37 @@ If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app 
 2. Press `⌃⌥A` → speak command → `⌃⌥A`
 3. Command appears in terminal
 
+### Batch Transcription
+
+Process multiple audio files at once:
+
+1. Click menubar icon 🎤 → **批次轉錄...** (Batch Transcribe...)
+2. Enter directory path containing audio files (supports .wav, .mp3, .m4a)
+   - Default: `~/Downloads/recordings`
+3. App will:
+   - Transcribe all audio files
+   - Save each transcription as .txt file next to the audio file
+   - Copy all transcriptions to clipboard
+   - Show summary notification
+
+**Example:**
+```
+Directory: ~/Downloads/recordings
+Files: audio1.wav, audio2.mp3, audio3.m4a
+
+Results:
+- audio1.txt (transcription)
+- audio2.txt (transcription)
+- audio3.txt (transcription)
+- All transcriptions copied to clipboard
+```
+
+**Features:**
+- Automatic retry on failure (1 retry per file)
+- Traditional Chinese output (simplified → traditional conversion)
+- Progress notifications
+- Error handling (continues on individual file failures)
+
 ## Troubleshooting
 
 **No auto-paste?**

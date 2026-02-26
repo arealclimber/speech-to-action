@@ -21,6 +21,7 @@ from scipy.io import wavfile
 import tempfile
 import logging
 from opencc import OpenCC
+from batch_transcribe import batch_transcribe_directory, TranscriptionResult
 
 # 將不常用的繁體字改成常用的（來自 clip2trad-python）
 MANUAL_MAPPINGS = {
@@ -31,6 +32,26 @@ MANUAL_MAPPINGS = {
     '喫': '吃',
     '纔': '才',
 }
+
+# 超過此秒數的錄音自動使用 long transcription endpoint（AssemblyAI）
+LONG_AUDIO_DURATION_THRESHOLD = 300  # 5 分鐘
+
+REFINE_SYSTEM_PROMPT = (
+    "你是一個文字潤飾助手。你的唯一任務是潤飾用戶提供的文字。\n"
+    "規則：\n"
+    "1. 只輸出潤飾後的文字，不要有任何其他內容\n"
+    "2. 不要加開頭語、解釋、分析、編號、標題\n"
+    "3. 不要說「潤飾後的內容：」之類的前綴\n"
+    "4. 不要搜尋網路、不要引用資料\n"
+    "5. 直接回覆潤飾結果，一個字的前綴都不要有"
+)
+
+REFINE_USER_PROMPT = (
+    "潤飾以下內容。保留原話語言（中文／英文／中英夾雜），嚴守 3 條件：\n"
+    "- 最小幅度修改：保留原本詞彙和句型，不要大幅重寫\n"
+    "- 維持口語：保留真誠自然的聊天風格和語氣詞\n"
+    "- 優化閱讀：拆斷過長句子、補標點、順邏輯\n\n"
+)
 
 
 def apply_manual_mappings(text, mappings):
@@ -142,15 +163,19 @@ class SpeechToClipboardApp(rumps.App):
         self.audio_queue = queue.Queue()
         self.audio_data = []
         self.audio_lock = threading.Lock()  # 新增：保護 audio_data
-        self.recording_thread = None 
+        self.recording_thread = None
+        self.recording_mode = "transcribe"  # "transcribe" or "refine"
 
         # 設置菜單
         self.menu = [
             rumps.MenuItem("開始錄音 (⌃⌥A)", callback=self.toggle_recording, key="a"),
+            rumps.MenuItem("潤飾語音 (⌃⌥S)", callback=self.toggle_refine_recording),
             rumps.separator,
             rumps.MenuItem("錄音中...", callback=None),
             rumps.separator,
             rumps.MenuItem("最近結果"),
+            rumps.separator,
+            rumps.MenuItem("批次轉錄...", callback=self.batch_transcribe),
             rumps.separator,
             rumps.MenuItem("設定"),
             rumps.MenuItem("關於"),
@@ -182,6 +207,27 @@ class SpeechToClipboardApp(rumps.App):
         # 啟動全局快捷鍵監聽
         self.start_global_hotkey_listener()
 
+        # Chat client（用於潤飾功能）
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if self.client:
+            # use_ai_builder=False → 已有 OpenAI client
+            self.chat_client = self.client
+            self.refine_model = "gpt-4o-mini"
+        elif openai_key:
+            # AI Builder 轉錄，但有 OpenAI key 可用於 chat
+            self.chat_client = OpenAI(api_key=openai_key)
+            self.refine_model = "gpt-4o-mini"
+        elif self.use_ai_builder:
+            # 用 AI Builder chat completions endpoint
+            self.chat_client = OpenAI(
+                api_key=self.ai_builder_api_key,
+                base_url=self.ai_builder_base + "/v1"
+            )
+            self.refine_model = "gemini-3-flash-preview"
+        else:
+            self.chat_client = None
+            self.refine_model = None
+
     def check_accessibility_permission(self):
         """檢查輔助功能權限"""
         options = {kAXTrustedCheckOptionPrompt: True}
@@ -196,7 +242,7 @@ class SpeechToClipboardApp(rumps.App):
         settings_menu = [
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
-            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥A)", callback=self.toggle_global_hotkey),
+            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥A/S)", callback=self.toggle_global_hotkey),
             rumps.MenuItem(model_label, callback=None),
         ]
         self.menu["設定"] = settings_menu
@@ -221,11 +267,11 @@ class SpeechToClipboardApp(rumps.App):
         """切換全局快捷鍵功能"""
         self.global_hotkey_enabled = not self.global_hotkey_enabled
         if self.global_hotkey_enabled:
-            sender.title = "✓ 全局快捷鍵 (⌃⌥A)"
+            sender.title = "✓ 全局快捷鍵 (⌃⌥A/S)"
             self.start_global_hotkey_listener()
             logger.info("Global hotkey enabled")
         else:
-            sender.title = "全局快捷鍵 (⌃⌥A)"
+            sender.title = "全局快捷鍵 (⌃⌥A/S)"
             self.stop_global_hotkey_listener()
             logger.info("Global hotkey disabled")
 
@@ -238,21 +284,31 @@ class SpeechToClipboardApp(rumps.App):
         self.stop_global_hotkey_listener()
 
         try:
-            # 定義快捷鍵組合：Control + Option + A
-            hotkey_combination = keyboard.HotKey(
+            # 定義快捷鍵組合
+            hotkey_transcribe = keyboard.HotKey(
                 keyboard.HotKey.parse('<ctrl>+<alt>+a'),
                 self.on_hotkey_pressed
             )
+            hotkey_refine = keyboard.HotKey(
+                keyboard.HotKey.parse('<ctrl>+<alt>+s'),
+                self.on_refine_hotkey_pressed
+            )
 
-            # 創建監聽器
+            # 創建監聽器（支援多組快捷鍵）
             self.hotkey_listener = keyboard.Listener(
-                on_press=lambda key: hotkey_combination.press(self.hotkey_listener.canonical(key)),
-                on_release=lambda key: hotkey_combination.release(self.hotkey_listener.canonical(key))
+                on_press=lambda key: (
+                    hotkey_transcribe.press(self.hotkey_listener.canonical(key)),
+                    hotkey_refine.press(self.hotkey_listener.canonical(key)),
+                ),
+                on_release=lambda key: (
+                    hotkey_transcribe.release(self.hotkey_listener.canonical(key)),
+                    hotkey_refine.release(self.hotkey_listener.canonical(key)),
+                )
             )
 
             # 啟動監聽器（在後台線程運行）
             self.hotkey_listener.start()
-            logger.info("Global hotkey listener started (Control+Option+A)")
+            logger.info("Global hotkey listener started (⌃⌥A: transcribe, ⌃⌥S: refine)")
 
         except Exception as e:
             logger.error(f"Failed to start global hotkey listener: {e}")
@@ -273,10 +329,24 @@ class SpeechToClipboardApp(rumps.App):
                 logger.error(f"Failed to stop global hotkey listener: {e}")
 
     def on_hotkey_pressed(self):
-        """全局快捷鍵被按下的回調"""
+        """全局快捷鍵被按下的回調（⌃⌥A 語音轉文字）"""
         logger.info("Global hotkey pressed (Control+Option+A)")
-        # 切換錄音狀態
+        if not self.recording:
+            self.recording_mode = "transcribe"
         self.toggle_recording(None)
+
+    def on_refine_hotkey_pressed(self):
+        """潤飾快捷鍵被按下的回調（⌃⌥S 語音潤飾）"""
+        logger.info("Refine hotkey pressed (Control+Option+S)")
+        if not self.recording:
+            self.recording_mode = "refine"
+        self.toggle_recording(None)
+
+    def toggle_refine_recording(self, sender):
+        """從菜單觸發潤飾錄音"""
+        if not self.recording:
+            self.recording_mode = "refine"
+        self.toggle_recording(sender)
 
     def change_language(self, sender):
         """更改語言設定"""
@@ -441,6 +511,8 @@ class SpeechToClipboardApp(rumps.App):
         
         self.title = "🔴"  # 改變狀態列圖示為紅點
         self.menu["開始錄音 (⌃⌥A)"].title = "停止錄音 (⌃⌥A)"
+        if self.recording_mode == "refine":
+            self.menu["潤飾語音 (⌃⌥S)"].title = "⏺ 潤飾錄音中..."
         self.menu["錄音中..."].state = True
 
         logger.info("Recording started...")
@@ -520,6 +592,8 @@ class SpeechToClipboardApp(rumps.App):
         self.processing = True  # 標記開始處理
         self.title = "🔄"  # 立即顯示處理中圖標
         self.menu["開始錄音 (⌃⌥A)"].title = "處理中..."
+        if self.recording_mode == "refine":
+            self.menu["潤飾語音 (⌃⌥S)"].title = "處理中..."
         self.menu["錄音中..."].state = False
 
         logger.info("Recording stopped, waiting for audio thread to finish...")
@@ -542,6 +616,7 @@ class SpeechToClipboardApp(rumps.App):
             self.title = "🎤"  # 恢復狀態列圖示
             self.processing = False
             self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
+            self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
             rumps.notification(
                 "語音轉文字",
                 "未錄到音頻",
@@ -576,7 +651,14 @@ class SpeechToClipboardApp(rumps.App):
 
             logger.info(f"Audio saved to: {temp_path}")
 
-            if self.use_ai_builder:
+            # 計算音頻時長
+            audio_duration = len(audio_array) / self.sample_rate
+            use_long = self.use_ai_builder and audio_duration > LONG_AUDIO_DURATION_THRESHOLD
+
+            if use_long:
+                # 使用 AI Builder long transcription API（適合小時級長度音頻）
+                text = self._transcribe_ai_builder_long(temp_path)
+            elif self.use_ai_builder:
                 # 使用 AI Builder 轉錄 API（標準庫 urllib，無需 requests）
                 url = f"{self.ai_builder_base}/v1/audio/transcriptions"
                 lang = getattr(self, "language", None)
@@ -622,11 +704,27 @@ class SpeechToClipboardApp(rumps.App):
             text = apply_manual_mappings(text, MANUAL_MAPPINGS)
             logger.info(f"Transcription result (traditional): {text}")
 
+            # 潤飾模式：呼叫 LLM 潤飾
+            original_text = text
+            if self.recording_mode == "refine":
+                # 先把原始文字稿存到剪貼簿（轉錄完成即可用）
+                self.copy_to_clipboard(original_text)
+                logger.info(f"[Original → clipboard] {original_text}")
+
+                self.title = "✨"
+                refined = self._refine_text(original_text)
+                if refined:
+                    text = refined
+                    logger.info(f"[Refined] {text}")
+                else:
+                    logger.warning("Refine failed, keeping original in clipboard")
+
             # 恢復圖示和狀態
             self.title = "🎤"
             self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
+            self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
 
-            # 複製到剪貼板
+            # 複製到剪貼板（refine 模式下覆蓋為潤飾結果）
             self.copy_to_clipboard(text)
 
             # 添加到最近結果
@@ -639,17 +737,18 @@ class SpeechToClipboardApp(rumps.App):
                 pasted = self.auto_paste_to_focused_app(text)
 
             # 顯示通知
+            mode_label = "語音潤飾完成" if self.recording_mode == "refine" else "語音轉文字完成"
             if pasted:
                 app_info = self.get_focused_app_info()
                 app_name = app_info['name'] if app_info else "應用"
                 rumps.notification(
-                    "語音轉文字完成",
+                    mode_label,
                     f"已自動粘貼到 {app_name}",
                     text[:100] + "..." if len(text) > 100 else text
                 )
             else:
                 rumps.notification(
-                    "語音轉文字完成",
+                    mode_label,
                     "已複製到剪貼板" if not self.auto_paste_enabled else "已複製到剪貼板（粘貼失敗）",
                     text[:100] + "..." if len(text) > 100 else text
                 )
@@ -659,6 +758,7 @@ class SpeechToClipboardApp(rumps.App):
             # 恢復圖示和狀態
             self.title = "🎤"
             self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
+            self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
             rumps.notification(
                 "轉換錯誤",
                 "無法轉換語音為文字",
@@ -676,6 +776,116 @@ class SpeechToClipboardApp(rumps.App):
                 except Exception as e:
                     logger.warning(f"Failed to delete temp file: {e}")
 
+    def _refine_text(self, text):
+        """使用 LLM 潤飾文字"""
+        if not self.chat_client:
+            logger.warning("No chat client available for refine feature")
+            rumps.notification("潤飾失敗", "需要 OpenAI API Key", "請設置 OPENAI_API_KEY")
+            return None
+        try:
+            logger.info(f"Refining with model: {self.refine_model}")
+            response = self.chat_client.chat.completions.create(
+                model=self.refine_model,
+                messages=[
+                    {"role": "system", "content": REFINE_SYSTEM_PROMPT},
+                    {"role": "user", "content": REFINE_USER_PROMPT + text}
+                ],
+                temperature=0.3,
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Refine error: {e}", exc_info=True)
+            rumps.notification("潤飾失敗", "LLM 呼叫失敗", str(e)[:100])
+            return None
+
+    def _transcribe_ai_builder_long(self, audio_path: str) -> str:
+        """使用 AI Builder long transcription API 轉錄長音頻（小時級）
+
+        呼叫 /v1/audio/transcriptions_long（AssemblyAI），支援：
+        - sentence-level timestamps
+        - speaker diarization
+        - disfluency removal
+
+        Args:
+            audio_path: WAV/MP3/M4A 音頻檔路徑
+
+        Returns:
+            轉錄文字
+        """
+        url = f"{self.ai_builder_base}/v1/audio/transcriptions_long"
+        lang = getattr(self, "language", None)
+        boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
+
+        filename = os.path.basename(audio_path)
+        suffix = os.path.splitext(audio_path)[1].lstrip(".")
+        content_type = f"audio/{suffix}" if suffix else "audio/wav"
+
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+
+        # 構建 multipart body
+        parts = []
+        # audio_file
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="audio_file"; filename="{filename}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        )
+        body = parts[0].encode("utf-8") + audio_bytes
+
+        # language（可選）
+        if lang:
+            body += (
+                f"\r\n--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="language"\r\n\r\n'
+                f"{lang}"
+            ).encode("utf-8")
+
+        # speaker_labels=true
+        body += (
+            f"\r\n--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="speaker_labels"\r\n\r\n'
+            f"true"
+        ).encode("utf-8")
+
+        # disfluencies=false（保留原始語音）
+        body += (
+            f"\r\n--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="disfluencies"\r\n\r\n'
+            f"false"
+        ).encode("utf-8")
+
+        body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.ai_builder_api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+
+        # 長音頻需要更長的 timeout（1 小時音頻大約需要 5-10 分鐘處理）
+        timeout = 600  # 10 分鐘
+        logger.info("Calling long transcription API (timeout=%ds)...", timeout)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read().decode())
+
+        text = result.get("text", "").strip()
+        duration = result.get("duration_seconds")
+        confidence = result.get("confidence")
+        speakers = result.get("speakers")
+        logger.info(
+            "Long transcription done: duration=%.1fs, confidence=%.3f, speakers=%d segments",
+            duration or 0,
+            confidence or 0,
+            len(speakers) if speakers else 0,
+        )
+        logger.info("Long transcription result (original): %s", text[:200] + "..." if len(text) > 200 else text)
+        return text
+
     def copy_to_clipboard(self, text):
         """複製文字到剪貼板"""
         try:
@@ -684,18 +894,131 @@ class SpeechToClipboardApp(rumps.App):
         except Exception as e:
             logger.error(f"Failed to copy to clipboard: {e}")
 
+    def batch_transcribe(self, _):
+        """批次轉錄目錄中的所有音頻文件"""
+        # 使用 rumps.Window 讓用戶輸入目錄路徑
+        response = rumps.Window(
+            "批次轉錄",
+            "請輸入包含音頻文件的目錄路徑:",
+            default_text="~/Downloads/recordings",
+            ok="開始轉錄",
+            cancel="取消"
+        ).run()
+
+        if not response.clicked:
+            return
+
+        directory = response.text.strip()
+        if not directory:
+            rumps.alert("錯誤", "請輸入有效的目錄路徑")
+            return
+
+        # 展開 ~ 符號
+        directory = os.path.expanduser(directory)
+
+        if not os.path.isdir(directory):
+            rumps.alert("錯誤", f"目錄不存在: {directory}")
+            return
+
+        # 在後台線程中處理，避免阻塞 UI
+        threading.Thread(
+            target=self._process_batch_transcription,
+            args=(directory,),
+            daemon=True
+        ).start()
+
+    def _process_batch_transcription(self, directory: str):
+        """在後台處理批次轉錄"""
+        try:
+            # 顯示開始通知
+            rumps.notification(
+                "批次轉錄",
+                "開始處理...",
+                f"正在掃描目錄: {directory}"
+            )
+
+            # 確定使用哪個 API
+            if self.use_ai_builder:
+                api_key = self.ai_builder_api_key
+                api_base = self.ai_builder_base
+            else:
+                api_key = os.getenv("OPENAI_API_KEY")
+                api_base = "https://api.openai.com"
+
+            # 執行批次轉錄
+            language = getattr(self, "language", None)
+            results = batch_transcribe_directory(
+                directory=directory,
+                api_key=api_key,
+                api_base=api_base,
+                language=language,
+                save_txt=True,
+                max_retries=1
+            )
+
+            # 統計結果
+            successes = [r for r in results if r.success]
+            failures = [r for r in results if not r.success]
+
+            # 應用繁體轉換到所有成功的轉錄
+            processed_texts = []
+            for result in successes:
+                if result.text:
+                    # 轉換為繁體中文
+                    text = self.cc.convert(result.text)
+                    # 應用手動映射
+                    text = apply_manual_mappings(text, MANUAL_MAPPINGS)
+                    processed_texts.append(f"[{os.path.basename(result.file_path)}]\n{text}")
+
+                    # 更新保存的 .txt 文件（用繁體版本）
+                    from pathlib import Path
+                    txt_path = Path(result.file_path).with_suffix('.txt')
+                    try:
+                        txt_path.write_text(text, encoding='utf-8')
+                    except Exception as e:
+                        logger.error(f"Failed to update txt file: {e}")
+
+            # 將所有轉錄複製到剪貼板
+            if processed_texts:
+                all_text = "\n\n".join(processed_texts)
+                self.copy_to_clipboard(all_text)
+
+            # 顯示完成通知
+            if failures:
+                rumps.notification(
+                    "批次轉錄完成",
+                    f"成功: {len(successes)}, 失敗: {len(failures)}",
+                    f"結果已複製到剪貼板\n失敗的文件:\n" + "\n".join([os.path.basename(f.file_path) for f in failures[:3]])
+                )
+            else:
+                rumps.notification(
+                    "批次轉錄完成",
+                    f"成功轉錄 {len(successes)} 個文件",
+                    "所有結果已複製到剪貼板並保存為 .txt 文件"
+                )
+
+        except Exception as e:
+            logger.error(f"Batch transcription error: {e}", exc_info=True)
+            rumps.notification(
+                "批次轉錄錯誤",
+                "處理失敗",
+                str(e)[:100]
+            )
+
     @rumps.clicked("關於")
     def about(self, _):
         """顯示關於信息"""
         rumps.alert(
-            "語音轉文字 v1.1",
+            "語音轉文字 v1.2",
             "一個簡單的 macOS 狀態列應用\n"
             "使用 OpenAI Whisper API 進行語音識別\n\n"
             "快捷鍵:\n"
-            "  ⌃⌥A - 全局快捷鍵（隨時可用）\n"
+            "  ⌃⌥A - 語音轉文字\n"
+            "  ⌃⌥S - 語音潤飾（轉文字＋LLM 潤飾）\n"
             "  ⌘A - 菜單快捷鍵（需打開菜單）\n\n"
             "功能:\n"
             "  • 語音轉文字\n"
+            "  • 語音潤飾（AI 修飾口語）\n"
             "  • 自動粘貼到焦點應用\n"
             "  • 全局快捷鍵\n\n"
             "© 2025"
