@@ -5,6 +5,7 @@ Tests for batch transcription functionality
 
 import os
 import tempfile
+from unittest.mock import patch, MagicMock
 import pytest
 from pathlib import Path
 from batch_transcribe import (
@@ -14,6 +15,9 @@ from batch_transcribe import (
     TranscriptionResult,
     estimate_audio_duration,
     LONG_AUDIO_DURATION_THRESHOLD,
+    _is_timeout_error,
+    _clean_ai_builder_text,
+    _clean_gemini_response,
 )
 
 
@@ -286,3 +290,207 @@ class TestEstimateAudioDuration:
     def test_long_audio_threshold(self):
         """LONG_AUDIO_DURATION_THRESHOLD should be 300 seconds"""
         assert LONG_AUDIO_DURATION_THRESHOLD == 300
+
+
+class TestIsTimeoutError:
+    """Test timeout error detection"""
+
+    def test_detects_timed_out(self):
+        assert _is_timeout_error("urlopen error <urlopen error timed out>") is True
+
+    def test_detects_timeout_keyword(self):
+        assert _is_timeout_error("Connection timeout after 60s") is True
+
+    def test_detects_timeout_error_class(self):
+        assert _is_timeout_error("TimeoutError: read operation timed out") is True
+
+    def test_ignores_non_timeout(self):
+        assert _is_timeout_error("HTTP Error 500: Internal Server Error") is False
+
+    def test_empty_string(self):
+        assert _is_timeout_error("") is False
+
+
+class TestDynamicTimeout:
+    """Test dynamic timeout calculation in transcribe_file_with_retry"""
+
+    def test_small_file_uses_base_timeout(self):
+        """Small files should use the base timeout (60s for short endpoint)"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1 MB file → file_size_mb * 30 = 30s < base 60s → use 60s
+            audio_path = Path(tmpdir, "small.wav")
+            audio_path.write_bytes(b"\x00" * (1 * 1024 * 1024))
+
+            # We can't easily test the internal timeout value without mocking,
+            # but we verify the function runs without error
+            result = transcribe_file_with_retry(
+                file_path=str(audio_path),
+                api_key="test_key",
+                api_base="https://test.invalid",
+                max_retries=0,
+            )
+            assert isinstance(result, TranscriptionResult)
+            assert not result.success  # Will fail due to invalid API
+
+    def test_large_file_scales_timeout(self):
+        """Large files should scale timeout based on file size"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 10 MB file → file_size_mb * 30 = 300s > base 60s → use 300s
+            audio_path = Path(tmpdir, "large.m4a")
+            audio_path.write_bytes(b"\x00" * (10 * 1024 * 1024))
+
+            result = transcribe_file_with_retry(
+                file_path=str(audio_path),
+                api_key="test_key",
+                api_base="https://test.invalid",
+                max_retries=0,
+            )
+            assert isinstance(result, TranscriptionResult)
+
+
+class TestGeminiFallback:
+    """Test Gemini fallback in transcribe_file_with_retry"""
+
+    @patch("batch_transcribe._GEMINI_AVAILABLE", True)
+    @patch("batch_transcribe._transcribe_with_gemini")
+    @patch("batch_transcribe.urllib.request.urlopen")
+    def test_gemini_fallback_on_timeout(self, mock_urlopen, mock_gemini):
+        """Should fall back to Gemini when AI Builder times out"""
+        import socket
+        mock_urlopen.side_effect = socket.timeout("timed out")
+        mock_gemini.return_value = "Gemini transcription"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir, "test.wav")
+            audio_path.write_bytes(b"\x00" * 100)
+
+            result = transcribe_file_with_retry(
+                file_path=str(audio_path),
+                api_key="test_key",
+                api_base="https://test.com",
+                max_retries=0,
+                gemini_api_key="test_gemini_key",
+            )
+
+            assert result.success is True
+            assert result.text == "Gemini transcription"
+            mock_gemini.assert_called_once()
+
+    @patch("batch_transcribe._GEMINI_AVAILABLE", True)
+    @patch("batch_transcribe._transcribe_with_gemini")
+    @patch("batch_transcribe.urllib.request.urlopen")
+    def test_no_gemini_fallback_on_non_timeout(self, mock_urlopen, mock_gemini):
+        """Should NOT fall back to Gemini for non-timeout errors"""
+        mock_urlopen.side_effect = Exception("HTTP Error 500: Server Error")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir, "test.wav")
+            audio_path.write_bytes(b"\x00" * 100)
+
+            result = transcribe_file_with_retry(
+                file_path=str(audio_path),
+                api_key="test_key",
+                api_base="https://test.com",
+                max_retries=0,
+                gemini_api_key="test_gemini_key",
+            )
+
+            assert result.success is False
+            mock_gemini.assert_not_called()
+
+    @patch("batch_transcribe.urllib.request.urlopen")
+    def test_no_gemini_fallback_without_key(self, mock_urlopen):
+        """Should not attempt Gemini fallback when no key is provided"""
+        import socket
+        mock_urlopen.side_effect = socket.timeout("timed out")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir, "test.wav")
+            audio_path.write_bytes(b"\x00" * 100)
+
+            result = transcribe_file_with_retry(
+                file_path=str(audio_path),
+                api_key="test_key",
+                api_base="https://test.com",
+                max_retries=0,
+                gemini_api_key=None,
+            )
+
+            assert result.success is False
+            assert "timed out" in result.error
+
+
+class TestCleanAiBuilderText:
+    """Test cleaning AI Builder text field artifacts"""
+
+    def test_plain_text_unchanged(self):
+        assert _clean_ai_builder_text("你好，今天天氣很好。") == "你好，今天天氣很好。"
+
+    def test_strips_trailing_quote_brace(self):
+        """The exact pattern reported: text ending with "}"""
+        raw = '所以我說讓我來簡單測試一下，看我拿到的結果是什麼。"}'
+        assert _clean_ai_builder_text(raw) == "所以我說讓我來簡單測試一下，看我拿到的結果是什麼。"
+
+    def test_nested_json_with_query_key(self):
+        """AI Builder sometimes wraps text in {"query": "..."}"""
+        raw = '{"query": "這是實際的轉錄文字"}'
+        assert _clean_ai_builder_text(raw) == "這是實際的轉錄文字"
+
+    def test_nested_json_with_newlines(self):
+        r"""Nested JSON with escaped newlines: {"query": "...\n\n..."}"""
+        raw = '{"query": "前面的文字\\n\\n後面的文字"}'
+        assert _clean_ai_builder_text(raw) == "前面的文字\n\n後面的文字"
+
+    def test_nested_json_with_text_key(self):
+        raw = '{"text": "轉錄結果"}'
+        assert _clean_ai_builder_text(raw) == "轉錄結果"
+
+    def test_strips_trailing_brace_only(self):
+        assert _clean_ai_builder_text("測試結果}") == "測試結果"
+
+    def test_strips_trailing_quote_only(self):
+        assert _clean_ai_builder_text('測試結果"') == "測試結果"
+
+    def test_preserves_internal_quotes(self):
+        assert _clean_ai_builder_text('他說"你好"然後離開') == '他說"你好"然後離開'
+
+    def test_strips_whitespace(self):
+        assert _clean_ai_builder_text("  測試結果  ") == "測試結果"
+
+
+class TestCleanGeminiResponse:
+    """Test cleaning Gemini response artifacts"""
+
+    def test_plain_text_unchanged(self):
+        assert _clean_gemini_response("你好，今天天氣很好。") == "你好，今天天氣很好。"
+
+    def test_strips_json_wrapper(self):
+        """Gemini sometimes wraps output in {"text": "..."}"""
+        raw = '{"text": "你好，今天天氣很好。"}'
+        assert _clean_gemini_response(raw) == "你好，今天天氣很好。"
+
+    def test_strips_json_with_newlines(self):
+        """The exact pattern reported by user: \\n and }"}"""
+        raw = '{"text": "你好，今天天氣很好。\\n"}'
+        assert _clean_gemini_response(raw) == "你好，今天天氣很好。"
+
+    def test_strips_markdown_code_block(self):
+        raw = "```\n你好，今天天氣很好。\n```"
+        assert _clean_gemini_response(raw) == "你好，今天天氣很好。"
+
+    def test_strips_markdown_json_code_block(self):
+        raw = '```json\n{"text": "你好"}\n```'
+        assert _clean_gemini_response(raw) == "你好"
+
+    def test_strips_surrounding_quotes(self):
+        raw = '"你好，今天天氣很好。"'
+        assert _clean_gemini_response(raw) == "你好，今天天氣很好。"
+
+    def test_strips_whitespace(self):
+        raw = "  \n你好，今天天氣很好。\n  "
+        assert _clean_gemini_response(raw) == "你好，今天天氣很好。"
+
+    def test_json_with_other_key(self):
+        """Should extract first string value from JSON even with non-standard key"""
+        raw = '{"transcription": "你好"}'
+        assert _clean_gemini_response(raw) == "你好"

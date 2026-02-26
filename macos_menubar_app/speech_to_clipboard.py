@@ -23,6 +23,15 @@ import logging
 from opencc import OpenCC
 from batch_transcribe import batch_transcribe_directory, TranscriptionResult
 
+# Gemini SDK — optional, lazy import for fallback transcription
+_GEMINI_AVAILABLE = False
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    pass
+
 # 將不常用的繁體字改成常用的（來自 clip2trad-python）
 MANUAL_MAPPINGS = {
     '瞭解': '了解',
@@ -96,6 +105,42 @@ def get_ai_builder_api_key():
         pass
     return None
 
+
+def get_gemini_api_key():
+    """
+    取得 Gemini API key：依序檢查 GEMINI_API_KEY → GOOGLE_API_KEY（環境變數或 ~/.zshrc）。
+    """
+    for var_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        key = os.environ.get(var_name)
+        if key and key.strip():
+            return key.strip()
+
+    zshrc = os.path.expanduser("~/.zshrc")
+    if not os.path.isfile(zshrc):
+        return None
+
+    try:
+        with open(zshrc, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+
+    for var_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        pattern = re.compile(
+            rf"^\s*(?:export\s+)?{var_name}\s*=\s*(?:(['\"])(.*?)\1|(\S+))\s*(?:#.*)?$",
+            re.MULTILINE,
+        )
+        m = pattern.search(content)
+        if m:
+            value = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+            if value.strip():
+                return value.strip()
+    return None
+
+
+# 20 MB inline upload limit for Gemini
+_GEMINI_INLINE_LIMIT = 20 * 1024 * 1024
+
 # macOS Accessibility 和按鍵模擬
 from AppKit import NSWorkspace
 from ApplicationServices import (
@@ -135,22 +180,32 @@ class SpeechToClipboardApp(rumps.App):
             quit_button=None  # 自定義退出按鈕
         )
 
-        # 選擇轉錄後端：若有 AI_BUILDER_API_KEY（環境變數或 ~/.zshrc）則用 AI Builder，否則用 OpenAI
+        # 偵測所有可用的轉錄 provider，建立 fallback chain
         ai_builder_key = get_ai_builder_api_key()
+        gemini_key = get_gemini_api_key() if _GEMINI_AVAILABLE else None
+        openai_key = os.getenv("OPENAI_API_KEY")
+
+        self.use_ai_builder = bool(ai_builder_key)
+        self.ai_builder_api_key = ai_builder_key
+        self.ai_builder_base = "https://space.ai-builders.com/backend" if ai_builder_key else None
+        self.gemini_api_key = gemini_key
+        self.gemini_client = None  # lazy init
+        self.client = OpenAI(api_key=openai_key) if openai_key else None
+
+        # 至少需要一個 provider
+        if not any([ai_builder_key, gemini_key, openai_key]):
+            rumps.alert("錯誤", "請設置至少一個轉錄 API Key\n(AI_BUILDER_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY)")
+            raise ValueError("No transcription API key found")
+
+        # Log fallback chain
+        chain_names = []
         if ai_builder_key:
-            self.use_ai_builder = True
-            self.ai_builder_api_key = ai_builder_key
-            self.ai_builder_base = "https://space.ai-builders.com/backend"
-            self.client = None
-            logger.info("Using AI Builder transcription: %s", self.ai_builder_base)
-        else:
-            self.use_ai_builder = False
-            api_key = os.getenv("OPENAI_API_KEY")
-            if not api_key:
-                rumps.alert("錯誤", "請設置 OPENAI_API_KEY 或 AI_BUILDER_API_KEY（可寫入 ~/.zshrc）")
-                raise ValueError("OPENAI_API_KEY or AI_BUILDER_API_KEY not set")
-            self.client = OpenAI(api_key=api_key)
-            logger.info("Using OpenAI transcription")
+            chain_names.append("AI Builder")
+        if gemini_key:
+            chain_names.append("Gemini")
+        if openai_key:
+            chain_names.append("OpenAI")
+        logger.info("Transcription chain: %s", " → ".join(chain_names))
 
         # 初始化簡繁轉換器（簡體轉繁體）
         self.cc = OpenCC('s2t')
@@ -238,7 +293,12 @@ class SpeechToClipboardApp(rumps.App):
 
     def setup_settings_menu(self):
         """設置設定子菜單"""
-        model_label = "模型: AI Builder 轉錄" if self.use_ai_builder else "模型: gpt-4o-mini-transcribe"
+        if self.use_ai_builder and self.gemini_api_key:
+            model_label = "轉錄: AI Builder (+Gemini fallback)"
+        elif self.use_ai_builder:
+            model_label = "轉錄: AI Builder"
+        else:
+            model_label = "轉錄: gpt-4o-mini-transcribe"
         settings_menu = [
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
@@ -651,52 +711,13 @@ class SpeechToClipboardApp(rumps.App):
 
             logger.info(f"Audio saved to: {temp_path}")
 
-            # 計算音頻時長
+            # 計算音頻時長，決定是否用 long endpoint
             audio_duration = len(audio_array) / self.sample_rate
             use_long = self.use_ai_builder and audio_duration > LONG_AUDIO_DURATION_THRESHOLD
 
-            if use_long:
-                # 使用 AI Builder long transcription API（適合小時級長度音頻）
-                text = self._transcribe_ai_builder_long(temp_path)
-            elif self.use_ai_builder:
-                # 使用 AI Builder 轉錄 API（標準庫 urllib，無需 requests）
-                url = f"{self.ai_builder_base}/v1/audio/transcriptions"
-                lang = getattr(self, "language", None)
-                boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
-                with open(temp_path, "rb") as audio_file:
-                    audio_bytes = audio_file.read()
-                body = (
-                    f"--{boundary}\r\n"
-                    'Content-Disposition: form-data; name="audio_file"; filename="audio.wav"\r\n'
-                    "Content-Type: audio/wav\r\n\r\n"
-                ).encode("utf-8") + audio_bytes
-                if lang:
-                    body += f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{lang}\r\n".encode("utf-8")
-                body += f"\r\n--{boundary}--\r\n".encode("utf-8")
-                req = urllib.request.Request(
-                    url,
-                    data=body,
-                    method="POST",
-                    headers={
-                        "Authorization": f"Bearer {self.ai_builder_api_key}",
-                        "Content-Type": f"multipart/form-data; boundary={boundary}",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    result = json.loads(resp.read().decode())
-                text = result.get("text", "").strip()
-                logger.info("AI Builder transcription result (original): %s", text)
-            else:
-                # 使用 OpenAI Whisper API 轉換
-                logger.info("Calling OpenAI Whisper API...")
-                with open(temp_path, "rb") as audio_file:
-                    transcript = self.client.audio.transcriptions.create(
-                        model="gpt-4o-mini-transcribe",
-                        file=audio_file,
-                        language=getattr(self, "language", None),
-                    )
-                text = transcript.text
-            logger.info(f"Transcription result (original): {text}")
+            # Fallback chain: AI Builder → Gemini → OpenAI
+            text, provider_name = self._transcribe_with_fallback(temp_path, use_long=use_long)
+            logger.info(f"Transcription result (original, via {provider_name}): {text}")
             
             # 將簡體中文轉換為繁體中文
             text = self.cc.convert(text)
@@ -736,8 +757,11 @@ class SpeechToClipboardApp(rumps.App):
             if self.auto_paste_enabled:
                 pasted = self.auto_paste_to_focused_app(text)
 
-            # 顯示通知
-            mode_label = "語音潤飾完成" if self.recording_mode == "refine" else "語音轉文字完成"
+            # 顯示通知（含 provider 名稱）
+            if self.recording_mode == "refine":
+                mode_label = "語音潤飾完成"
+            else:
+                mode_label = f"語音轉文字完成（{provider_name}）"
             if pasted:
                 app_info = self.get_focused_app_info()
                 app_name = app_info['name'] if app_info else "應用"
@@ -759,6 +783,11 @@ class SpeechToClipboardApp(rumps.App):
             self.title = "🎤"
             self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
+
+            # 全部失敗：保存錄音到持久目錄
+            if temp_path and os.path.exists(temp_path):
+                self._save_failed_recording(temp_path)
+
             rumps.notification(
                 "轉換錯誤",
                 "無法轉換語音為文字",
@@ -768,13 +797,223 @@ class SpeechToClipboardApp(rumps.App):
             # 確保 processing 標誌被重置
             self.processing = False
             logger.info("Processing completed, ready for next recording")
-            
-            # 清理臨時文件
+
+            # 成功時清理臨時文件（失敗時已搬移）
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.unlink(temp_path)
                 except Exception as e:
                     logger.warning(f"Failed to delete temp file: {e}")
+
+    def _save_failed_recording(self, temp_path: str):
+        """將失敗的錄音保存到持久目錄，並自動清理舊檔"""
+        try:
+            import shutil
+            save_dir = os.path.expanduser("~/Documents/SpeechToText/failed_recordings")
+            os.makedirs(save_dir, exist_ok=True)
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(save_dir, f"recording_{timestamp}.wav")
+            shutil.move(temp_path, dest)
+            logger.info(f"Failed recording saved to: {dest}")
+            rumps.notification("錄音已保存", "轉錄失敗，錄音已保存", dest)
+
+            # 自動清理：保留最新 50 個
+            files = sorted(
+                [os.path.join(save_dir, f) for f in os.listdir(save_dir)],
+                key=os.path.getmtime,
+            )
+            for old_file in files[:-50]:
+                try:
+                    os.unlink(old_file)
+                except OSError:
+                    pass
+        except Exception as e:
+            logger.warning(f"Failed to save recording: {e}")
+
+    # ------------------------------------------------------------------
+    # Transcription provider helpers
+    # ------------------------------------------------------------------
+
+    def _transcribe_ai_builder(self, audio_path: str) -> str:
+        """使用 AI Builder 短音頻轉錄 API"""
+        url = f"{self.ai_builder_base}/v1/audio/transcriptions"
+        lang = getattr(self, "language", None)
+        boundary = "----WebKitFormBoundary" + os.urandom(16).hex()
+        with open(audio_path, "rb") as audio_file:
+            audio_bytes = audio_file.read()
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="audio_file"; filename="audio.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode("utf-8") + audio_bytes
+        if lang:
+            body += f"\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n{lang}\r\n".encode("utf-8")
+        body += f"\r\n--{boundary}--\r\n".encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.ai_builder_api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode()
+        logger.debug("AI Builder raw response: %s", raw[:500])
+        result = json.loads(raw)
+        text = self._clean_ai_builder_text(result.get("text", ""))
+        logger.info("AI Builder transcription result (original): %s", text)
+        return text
+
+    def _transcribe_openai(self, audio_path: str) -> str:
+        """使用 OpenAI Whisper API 轉錄"""
+        logger.info("Calling OpenAI Whisper API...")
+        with open(audio_path, "rb") as audio_file:
+            transcript = self.client.audio.transcriptions.create(
+                model="gpt-4o-mini-transcribe",
+                file=audio_file,
+                language=getattr(self, "language", None),
+            )
+        return transcript.text
+
+    @staticmethod
+    def _clean_ai_builder_text(text: str) -> str:
+        """清理 AI Builder 回傳文字。
+
+        AI Builder 有時在 text 欄位塞入 nested JSON，例如：
+          {"query": "實際文字\\n\\n更多"}
+        需要解析取出真正的轉錄文字。
+        """
+        text = text.strip()
+        if text.startswith("{") or text.startswith('"'):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    text = (
+                        parsed.get("query")
+                        or parsed.get("text")
+                        or next((v for v in parsed.values() if isinstance(v, str)), text)
+                    )
+                elif isinstance(parsed, str):
+                    text = parsed
+            except (json.JSONDecodeError, StopIteration):
+                pass
+        text = re.sub(r'["\}\{]+\s*$', '', text)
+        return text.strip()
+
+    @staticmethod
+    def _clean_gemini_response(raw: str) -> str:
+        """清理 Gemini 回傳的轉錄文字，移除 JSON/markdown 包裝。
+
+        Gemini 是 LLM 而非專用 STT API，有時會把結果包在 JSON 或 markdown 裡，例如：
+          {"text": "你好\\n"}
+          ```\\n你好\\n```
+        """
+        text = raw.strip()
+
+        # 1) 移除 markdown code block
+        m = re.match(r"^```(?:json|text)?\s*\n?(.*?)\n?\s*```$", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+
+        # 2) 嘗試 JSON 解析
+        if text.startswith("{") or text.startswith('"'):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    text = parsed.get("text") or next(
+                        (v for v in parsed.values() if isinstance(v, str)), text
+                    )
+                elif isinstance(parsed, str):
+                    text = parsed
+            except (json.JSONDecodeError, StopIteration):
+                pass
+
+        # 3) 移除首尾殘留引號
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+            text = text[1:-1]
+
+        return text.strip()
+
+    def _transcribe_gemini(self, audio_path: str) -> str:
+        """使用 Gemini 2.5 Flash 轉錄音頻"""
+        if not _GEMINI_AVAILABLE:
+            raise ImportError("google-genai package is not installed")
+
+        if self.gemini_client is None:
+            self.gemini_client = genai.Client(api_key=self.gemini_api_key)
+
+        file_size = os.path.getsize(audio_path)
+        suffix = os.path.splitext(audio_path)[1].lstrip(".")
+        mime_type = f"audio/{suffix}" if suffix else "audio/wav"
+
+        prompt = (
+            "請將這段語音完整轉錄為文字。"
+            "只輸出轉錄的純文字，保留原始語言，不要翻譯、潤飾或摘要。"
+            "不要用 JSON、markdown、引號或任何格式包裝，直接輸出文字內容。"
+        )
+        lang = getattr(self, "language", None)
+        if lang:
+            prompt += f"\n語言提示: {lang}"
+
+        if file_size < _GEMINI_INLINE_LIMIT:
+            with open(audio_path, "rb") as f:
+                audio_bytes = f.read()
+            audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+        else:
+            logger.info("Gemini: file >= 20MB, using Files API upload...")
+            audio_part = self.gemini_client.files.upload(file=audio_path)
+
+        response = self.gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[audio_part, prompt],
+        )
+        text = self._clean_gemini_response(response.text)
+        logger.info("Gemini transcription result (original): %s", text)
+        return text
+
+    def _build_provider_chain(self, use_long: bool = False):
+        """依成本排序建立 provider fallback chain。
+
+        Returns:
+            list of (name, callable) tuples
+        """
+        chain = []
+        if self.use_ai_builder:
+            if use_long:
+                chain.append(("AI Builder (long)", self._transcribe_ai_builder_long))
+            else:
+                chain.append(("AI Builder", self._transcribe_ai_builder))
+        if self.gemini_api_key:
+            chain.append(("Gemini", self._transcribe_gemini))
+        if self.client:
+            chain.append(("OpenAI", self._transcribe_openai))
+        return chain
+
+    def _transcribe_with_fallback(self, audio_path: str, use_long: bool = False):
+        """
+        依序嘗試 provider chain，成功即回傳。
+
+        Returns:
+            (text, provider_name)
+
+        Raises:
+            RuntimeError: 所有 provider 皆失敗
+        """
+        chain = self._build_provider_chain(use_long)
+        errors = []
+        for i, (name, fn) in enumerate(chain):
+            try:
+                if i > 0:
+                    self.title = "🔁"
+                    rumps.notification("切換轉錄服務", f"改用 {name} 重試...", errors[-1][:60])
+                return fn(audio_path), name
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+                logger.warning("Provider failed: %s", errors[-1])
+        raise RuntimeError("所有轉錄服務皆失敗: " + "; ".join(errors))
 
     def _refine_text(self, text):
         """使用 LLM 潤飾文字"""
@@ -871,9 +1110,11 @@ class SpeechToClipboardApp(rumps.App):
         timeout = 600  # 10 分鐘
         logger.info("Calling long transcription API (timeout=%ds)...", timeout)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode())
+            raw = resp.read().decode()
+        logger.debug("AI Builder long raw response: %s", raw[:500])
+        result = json.loads(raw)
 
-        text = result.get("text", "").strip()
+        text = self._clean_ai_builder_text(result.get("text", ""))
         duration = result.get("duration_seconds")
         confidence = result.get("confidence")
         speakers = result.get("speakers")
@@ -947,13 +1188,15 @@ class SpeechToClipboardApp(rumps.App):
 
             # 執行批次轉錄
             language = getattr(self, "language", None)
+            gemini_key = get_gemini_api_key() if _GEMINI_AVAILABLE else None
             results = batch_transcribe_directory(
                 directory=directory,
                 api_key=api_key,
                 api_base=api_base,
                 language=language,
                 save_txt=True,
-                max_retries=1
+                max_retries=1,
+                gemini_api_key=gemini_key,
             )
 
             # 統計結果

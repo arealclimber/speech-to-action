@@ -15,6 +15,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Gemini SDK — optional, lazy import
+_GEMINI_AVAILABLE = False
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    _GEMINI_AVAILABLE = True
+except ImportError:
+    pass
+
 # 超過此秒數的音頻自動使用 long transcription endpoint
 LONG_AUDIO_DURATION_THRESHOLD = 300  # 5 分鐘
 
@@ -141,6 +150,143 @@ def _build_multipart_body(
     return body
 
 
+import re as _re
+
+
+def _clean_ai_builder_text(text: str) -> str:
+    """清理 AI Builder 回傳文字。
+
+    AI Builder 有時在 text 欄位塞入 nested JSON，例如：
+      {"query": "實際文字\\n\\n更多"}
+    需要解析取出真正的轉錄文字。
+    """
+    text = text.strip()
+
+    # 偵測 nested JSON（text 本身是 JSON object 或 string）
+    if text.startswith("{") or text.startswith('"'):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                # 取 "query" 或第一個字串值
+                text = (
+                    parsed.get("query")
+                    or parsed.get("text")
+                    or next((v for v in parsed.values() if isinstance(v, str)), text)
+                )
+            elif isinstance(parsed, str):
+                text = parsed
+        except (json.JSONDecodeError, StopIteration):
+            pass
+
+    # 清理尾端 JSON 殘留
+    text = _re.sub(r'["\}\{]+\s*$', '', text)
+    return text.strip()
+
+
+# 20 MB inline upload limit for Gemini
+_GEMINI_INLINE_LIMIT = 20 * 1024 * 1024
+
+_GEMINI_TRANSCRIBE_PROMPT = (
+    "請將這段語音完整轉錄為文字。"
+    "只輸出轉錄的純文字，保留原始語言，不要翻譯、潤飾或摘要。"
+    "不要用 JSON、markdown、引號或任何格式包裝，直接輸出文字內容。"
+)
+
+
+def _clean_gemini_response(raw: str) -> str:
+    """清理 Gemini 回傳的轉錄文字，移除 JSON/markdown 包裝。
+
+    Gemini 是 LLM 而非專用 STT API，有時會把結果包在 JSON 或 markdown 裡，例如：
+      {"text": "你好\\n"}
+      ```\n你好\n```
+    """
+    text = raw.strip()
+
+    # 1) 移除 markdown code block 包裝
+    m = _re.match(r"^```(?:json|text)?\s*\n?(.*?)\n?\s*```$", text, _re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+
+    # 2) 嘗試 JSON 解析（常見: {"text": "..."} 或純 JSON string）
+    if text.startswith("{") or text.startswith('"'):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                # 取第一個字串值（通常是 "text" key）
+                text = parsed.get("text") or next(
+                    (v for v in parsed.values() if isinstance(v, str)), text
+                )
+            elif isinstance(parsed, str):
+                text = parsed
+        except (json.JSONDecodeError, StopIteration):
+            pass
+
+    # 3) 移除首尾殘留引號
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1]
+
+    return text.strip()
+
+
+def _transcribe_with_gemini(
+    audio_path: str,
+    gemini_api_key: str,
+    language: Optional[str] = None,
+) -> str:
+    """
+    使用 Gemini 2.5 Flash 轉錄音頻。
+
+    < 20 MB: inline bytes 上傳
+    >= 20 MB: Files API 上傳
+
+    Args:
+        audio_path: 音頻檔路徑
+        gemini_api_key: Gemini API key
+        language: 語言提示（可選）
+
+    Returns:
+        轉錄文字
+
+    Raises:
+        ImportError: google-genai 未安裝
+        Exception: API 呼叫失敗
+    """
+    if not _GEMINI_AVAILABLE:
+        raise ImportError("google-genai package is not installed")
+
+    client = genai.Client(api_key=gemini_api_key)
+    file_size = os.path.getsize(audio_path)
+    suffix = Path(audio_path).suffix.lstrip(".")
+    mime_type = f"audio/{suffix}" if suffix else "audio/wav"
+
+    prompt = _GEMINI_TRANSCRIBE_PROMPT
+    if language:
+        prompt += f"\n語言提示: {language}"
+
+    if file_size < _GEMINI_INLINE_LIMIT:
+        # Inline upload
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type=mime_type)
+    else:
+        # Files API upload for large files
+        logger.info("Gemini: file >= 20MB, using Files API upload...")
+        uploaded = client.files.upload(file=audio_path)
+        audio_part = uploaded
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[audio_part, prompt],
+    )
+    return _clean_gemini_response(response.text)
+
+
+def _is_timeout_error(error_str: str) -> bool:
+    """判斷錯誤是否為 timeout 相關"""
+    timeout_keywords = ["timed out", "timeout", "TimeoutError", "urlopen error"]
+    return any(kw.lower() in error_str.lower() for kw in timeout_keywords)
+
+
 def transcribe_file_with_retry(
     file_path: str,
     api_key: str,
@@ -148,10 +294,12 @@ def transcribe_file_with_retry(
     language: Optional[str] = None,
     max_retries: int = 1,
     force_long: Optional[bool] = None,
+    gemini_api_key: Optional[str] = None,
 ) -> TranscriptionResult:
     """
     Transcribe a single audio file with retry logic.
     自動偵測音頻時長，超過閾值時使用 long transcription endpoint。
+    AI Builder 全部重試失敗且錯誤為 timeout 時，自動嘗試 Gemini fallback。
 
     Args:
         file_path: Path to audio file
@@ -161,6 +309,7 @@ def transcribe_file_with_retry(
         max_retries: Number of retries on failure (default 1)
         force_long: 強制使用 long endpoint (True) 或短 endpoint (False)。
                     None = 自動依時長判斷。
+        gemini_api_key: Optional Gemini API key for fallback transcription
 
     Returns:
         TranscriptionResult with success status and transcription or error
@@ -179,7 +328,16 @@ def transcribe_file_with_retry(
         )
 
     endpoint = "/v1/audio/transcriptions_long" if use_long else "/v1/audio/transcriptions"
-    timeout = 600 if use_long else 60  # 長音頻給 10 分鐘 timeout
+
+    # Dynamic timeout: scale with file size to avoid write-phase timeouts
+    base_timeout = 600 if use_long else 60
+    try:
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    except OSError:
+        file_size_mb = 0
+    timeout = max(base_timeout, int(file_size_mb * 30))
+    if timeout != base_timeout:
+        logger.info(f"Dynamic timeout: {timeout}s (file size: {file_size_mb:.1f}MB)")
 
     attempts = 0
     last_error = None
@@ -213,9 +371,11 @@ def transcribe_file_with_retry(
             )
 
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                result = json.loads(resp.read().decode())
+                raw = resp.read().decode()
+            logger.debug("AI Builder raw response: %s", raw[:500])
+            result = json.loads(raw)
 
-            text = result.get("text", "").strip()
+            text = _clean_ai_builder_text(result.get("text", ""))
             logger.info(f"Successfully transcribed {file_path}")
 
             return TranscriptionResult(
@@ -236,6 +396,23 @@ def transcribe_file_with_retry(
             if attempts > max_retries:
                 break
 
+    # Gemini fallback: only on timeout errors when gemini_api_key is available
+    if gemini_api_key and _GEMINI_AVAILABLE and _is_timeout_error(last_error or ""):
+        logger.info("AI Builder retries exhausted (timeout), attempting Gemini fallback...")
+        try:
+            text = _transcribe_with_gemini(file_path, gemini_api_key, language)
+            logger.info(f"Gemini fallback succeeded for {file_path}")
+            return TranscriptionResult(
+                file_path=file_path,
+                success=True,
+                text=text,
+                error=None,
+                used_long_endpoint=use_long,
+            )
+        except Exception as gemini_err:
+            logger.warning(f"Gemini fallback also failed for {file_path}: {gemini_err}")
+            last_error = f"AI Builder: {last_error}; Gemini: {gemini_err}"
+
     logger.error(f"Failed to transcribe {file_path} after {attempts} attempts: {last_error}")
     return TranscriptionResult(
         file_path=file_path,
@@ -254,6 +431,7 @@ def batch_transcribe_directory(
     save_txt: bool = True,
     max_retries: int = 1,
     force_long: Optional[bool] = None,
+    gemini_api_key: Optional[str] = None,
 ) -> List[TranscriptionResult]:
     """
     Transcribe all audio files in a directory.
@@ -267,6 +445,7 @@ def batch_transcribe_directory(
         max_retries: Number of retries per file on failure (default 1)
         force_long: 強制使用 long endpoint (True) 或短 endpoint (False)。
                     None = 自動依時長判斷。
+        gemini_api_key: Optional Gemini API key for fallback transcription
 
     Returns:
         List of TranscriptionResult for each file
@@ -288,6 +467,7 @@ def batch_transcribe_directory(
             language=language,
             max_retries=max_retries,
             force_long=force_long,
+            gemini_api_key=gemini_api_key,
         )
         results.append(result)
 
