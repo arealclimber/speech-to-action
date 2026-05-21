@@ -11,6 +11,7 @@ import urllib.error
 import rumps
 import sounddevice as sd
 import numpy as np
+import subprocess
 import threading
 import queue
 import os
@@ -21,7 +22,7 @@ from scipy.io import wavfile
 import tempfile
 import logging
 from opencc import OpenCC
-from batch_transcribe import batch_transcribe_directory, TranscriptionResult
+from batch_transcribe import batch_transcribe_directory, TranscriptionResult, _find_ffmpeg
 
 # Gemini SDK — optional, lazy import for fallback transcription
 _GEMINI_AVAILABLE = False
@@ -40,6 +41,7 @@ MANUAL_MAPPINGS = {
     '峯': '峰',
     '喫': '吃',
     '纔': '才',
+    '爲': '為'
 }
 
 # 超過此秒數的錄音自動使用 long transcription endpoint（AssemblyAI）
@@ -223,7 +225,7 @@ class SpeechToClipboardApp(rumps.App):
 
         # 設置菜單
         self.menu = [
-            rumps.MenuItem("開始錄音 (⌃⌥A)", callback=self.toggle_recording, key="a"),
+            rumps.MenuItem("開始錄音 (⌃⌥R)", callback=self.toggle_recording, key="a"),
             rumps.MenuItem("潤飾語音 (⌃⌥S)", callback=self.toggle_refine_recording),
             rumps.separator,
             rumps.MenuItem("錄音中...", callback=None),
@@ -231,6 +233,7 @@ class SpeechToClipboardApp(rumps.App):
             rumps.MenuItem("最近結果"),
             rumps.separator,
             rumps.MenuItem("批次轉錄...", callback=self.batch_transcribe),
+            rumps.MenuItem("WebM 轉 MP3...", callback=self.convert_webm_to_mp3),
             rumps.separator,
             rumps.MenuItem("設定"),
             rumps.MenuItem("關於"),
@@ -302,7 +305,7 @@ class SpeechToClipboardApp(rumps.App):
         settings_menu = [
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
-            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥A/S)", callback=self.toggle_global_hotkey),
+            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥R/⌃⌥S)", callback=self.toggle_global_hotkey),
             rumps.MenuItem(model_label, callback=None),
         ]
         self.menu["設定"] = settings_menu
@@ -327,11 +330,11 @@ class SpeechToClipboardApp(rumps.App):
         """切換全局快捷鍵功能"""
         self.global_hotkey_enabled = not self.global_hotkey_enabled
         if self.global_hotkey_enabled:
-            sender.title = "✓ 全局快捷鍵 (⌃⌥A/S)"
+            sender.title = "✓ 全局快捷鍵 (⌃⌥R/⌃⌥S)"
             self.start_global_hotkey_listener()
             logger.info("Global hotkey enabled")
         else:
-            sender.title = "全局快捷鍵 (⌃⌥A/S)"
+            sender.title = "全局快捷鍵 (⌃⌥R/⌃⌥S)"
             self.stop_global_hotkey_listener()
             logger.info("Global hotkey disabled")
 
@@ -346,7 +349,7 @@ class SpeechToClipboardApp(rumps.App):
         try:
             # 定義快捷鍵組合
             hotkey_transcribe = keyboard.HotKey(
-                keyboard.HotKey.parse('<ctrl>+<alt>+a'),
+                keyboard.HotKey.parse('<ctrl>+<alt>+r'),
                 self.on_hotkey_pressed
             )
             hotkey_refine = keyboard.HotKey(
@@ -368,7 +371,7 @@ class SpeechToClipboardApp(rumps.App):
 
             # 啟動監聽器（在後台線程運行）
             self.hotkey_listener.start()
-            logger.info("Global hotkey listener started (⌃⌥A: transcribe, ⌃⌥S: refine)")
+            logger.info("Global hotkey listener started (⌃⌥R: transcribe, ⌃⌥S: refine)")
 
         except Exception as e:
             logger.error(f"Failed to start global hotkey listener: {e}")
@@ -389,8 +392,8 @@ class SpeechToClipboardApp(rumps.App):
                 logger.error(f"Failed to stop global hotkey listener: {e}")
 
     def on_hotkey_pressed(self):
-        """全局快捷鍵被按下的回調（⌃⌥A 語音轉文字）"""
-        logger.info("Global hotkey pressed (Control+Option+A)")
+        """全局快捷鍵被按下的回調（⌃⌥R 語音轉文字）"""
+        logger.info("Global hotkey pressed (Control+Option+R)")
         if not self.recording:
             self.recording_mode = "transcribe"
         self.toggle_recording(None)
@@ -570,7 +573,7 @@ class SpeechToClipboardApp(rumps.App):
                 break
         
         self.title = "🔴"  # 改變狀態列圖示為紅點
-        self.menu["開始錄音 (⌃⌥A)"].title = "停止錄音 (⌃⌥A)"
+        self.menu["開始錄音 (⌃⌥R)"].title = "停止錄音 (⌃⌥R)"
         if self.recording_mode == "refine":
             self.menu["潤飾語音 (⌃⌥S)"].title = "⏺ 潤飾錄音中..."
         self.menu["錄音中..."].state = True
@@ -651,7 +654,7 @@ class SpeechToClipboardApp(rumps.App):
         self.recording = False
         self.processing = True  # 標記開始處理
         self.title = "🔄"  # 立即顯示處理中圖標
-        self.menu["開始錄音 (⌃⌥A)"].title = "處理中..."
+        self.menu["開始錄音 (⌃⌥R)"].title = "處理中..."
         if self.recording_mode == "refine":
             self.menu["潤飾語音 (⌃⌥S)"].title = "處理中..."
         self.menu["錄音中..."].state = False
@@ -675,7 +678,7 @@ class SpeechToClipboardApp(rumps.App):
         if not audio_data_copy:
             self.title = "🎤"  # 恢復狀態列圖示
             self.processing = False
-            self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
+            self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
             rumps.notification(
                 "語音轉文字",
@@ -742,7 +745,7 @@ class SpeechToClipboardApp(rumps.App):
 
             # 恢復圖示和狀態
             self.title = "🎤"
-            self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
+            self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
 
             # 複製到剪貼板（refine 模式下覆蓋為潤飾結果）
@@ -781,7 +784,7 @@ class SpeechToClipboardApp(rumps.App):
             logger.error(f"Audio processing error: {e}", exc_info=True)
             # 恢復圖示和狀態
             self.title = "🎤"
-            self.menu["開始錄音 (⌃⌥A)"].title = "開始錄音 (⌃⌥A)"
+            self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
 
             # 全部失敗：保存錄音到持久目錄
@@ -1248,6 +1251,86 @@ class SpeechToClipboardApp(rumps.App):
                 str(e)[:100]
             )
 
+    def convert_webm_to_mp3(self, _):
+        """將 .webm 檔案轉換為 .mp3"""
+        response = rumps.Window(
+            "WebM 轉 MP3",
+            "請輸入 .webm 檔案或目錄路徑:",
+            default_text="~/Downloads",
+            ok="開始轉換",
+            cancel="取消"
+        ).run()
+
+        if not response.clicked:
+            return
+
+        path = os.path.expanduser(response.text.strip())
+        if not path:
+            rumps.alert("錯誤", "請輸入有效的路徑")
+            return
+
+        if not os.path.exists(path):
+            rumps.alert("錯誤", f"路徑不存在: {path}")
+            return
+
+        threading.Thread(
+            target=self._process_webm_conversion,
+            args=(path,),
+            daemon=True
+        ).start()
+
+    def _process_webm_conversion(self, path: str):
+        """在後台處理 webm → mp3 轉換"""
+        try:
+            ffmpeg = _find_ffmpeg()
+            if not ffmpeg:
+                rumps.notification(
+                    "轉換失敗",
+                    "找不到 ffmpeg",
+                    "請安裝: brew install ffmpeg 或 pip install imageio-ffmpeg"
+                )
+                return
+
+            from pathlib import Path as P
+            target = P(path)
+            if target.is_dir():
+                webm_files = sorted(target.glob("*.webm"))
+            elif target.is_file() and target.suffix.lower() == ".webm":
+                webm_files = [target]
+            else:
+                rumps.notification("轉換失敗", "無效輸入", "請提供 .webm 檔案或包含 .webm 的目錄")
+                return
+
+            if not webm_files:
+                rumps.notification("轉換完成", "沒有找到 .webm 檔案", path)
+                return
+
+            rumps.notification("WebM 轉 MP3", "開始轉換...", f"{len(webm_files)} 個檔案")
+
+            succeeded, failed = 0, 0
+            for webm in webm_files:
+                mp3 = webm.with_suffix(".mp3")
+                result = subprocess.run(
+                    [ffmpeg, "-i", str(webm), "-vn", "-ab", "192k", "-y", str(mp3)],
+                    capture_output=True, text=True,
+                )
+                if result.returncode == 0:
+                    succeeded += 1
+                    logger.info(f"Converted: {webm} -> {mp3}")
+                else:
+                    failed += 1
+                    logger.error(f"Failed to convert {webm}: {result.stderr[:200]}")
+
+            rumps.notification(
+                "WebM 轉 MP3 完成",
+                f"成功: {succeeded}, 失敗: {failed}",
+                f"輸出目錄: {P(path).parent if P(path).is_file() else path}"
+            )
+
+        except Exception as e:
+            logger.error(f"WebM conversion error: {e}", exc_info=True)
+            rumps.notification("轉換錯誤", "處理失敗", str(e)[:100])
+
     @rumps.clicked("關於")
     def about(self, _):
         """顯示關於信息"""
@@ -1256,7 +1339,7 @@ class SpeechToClipboardApp(rumps.App):
             "一個簡單的 macOS 狀態列應用\n"
             "使用 OpenAI Whisper API 進行語音識別\n\n"
             "快捷鍵:\n"
-            "  ⌃⌥A - 語音轉文字\n"
+            "  ⌃⌥R - 語音轉文字\n"
             "  ⌃⌥S - 語音潤飾（轉文字＋LLM 潤飾）\n"
             "  ⌘A - 菜單快捷鍵（需打開菜單）\n\n"
             "功能:\n"

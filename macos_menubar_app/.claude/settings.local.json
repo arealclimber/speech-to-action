@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "Bash(uv sync:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python:*)",
+      "Bash(grep -n \"⌃⌥D\\\\|ctrl.*alt.*d\\\\|Ctrl.*Alt.*D\" /Users/shirley/arealclimber/speech-to-action/macos_menubar_app/README.md /Users/shirley/arealclimber/speech-to-action/README.md 2>/dev/null)",
+      "Read(//Users/shirley/arealclimber/speech-to-action/**)"
+    ]
+  }
+}

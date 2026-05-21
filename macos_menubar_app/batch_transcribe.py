@@ -6,6 +6,10 @@ Batch transcription functionality for processing multiple audio files
 import os
 import json
 import struct
+import subprocess
+import tempfile
+import shutil
+import wave
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -26,6 +30,9 @@ except ImportError:
 
 # 超過此秒數的音頻自動使用 long transcription endpoint
 LONG_AUDIO_DURATION_THRESHOLD = 300  # 5 分鐘
+
+# AI Builder API 上傳大小限制（實測 51MB 觸發 413）
+_AI_BUILDER_MAX_FILE_SIZE = 24 * 1024 * 1024  # 24 MB, conservative
 
 # 無法取得精確時長時，用檔案大小估算（保守估計，以 wav 16kHz mono 16bit = 32KB/s 為準）
 _WAV_BYTES_PER_SEC = 32_000
@@ -287,6 +294,236 @@ def _is_timeout_error(error_str: str) -> bool:
     return any(kw.lower() in error_str.lower() for kw in timeout_keywords)
 
 
+def _is_payload_too_large(error_str: str) -> bool:
+    """判斷錯誤是否為 413 Request Entity Too Large"""
+    return "413" in error_str or "Request Entity Too Large" in error_str
+
+
+def _find_ffmpeg() -> Optional[str]:
+    """Find ffmpeg binary: PATH → Homebrew → pip-installed packages."""
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    for candidate in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    # pip install imageio-ffmpeg bundles a ffmpeg binary
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return None
+
+
+def _split_audio_ffmpeg(
+    file_path: str,
+    max_size_bytes: int = _AI_BUILDER_MAX_FILE_SIZE,
+) -> Optional[List[str]]:
+    """用 ffmpeg segment 把大檔切成 <= max_size_bytes 的 chunks。
+
+    Returns:
+        chunk 檔案路徑 list（放在 tempdir 裡），或 None（ffmpeg 不存在/失敗）。
+        呼叫者需自行清理 tempdir。
+    """
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        return None
+
+    file_size = os.path.getsize(file_path)
+    if file_size <= max_size_bytes:
+        return [file_path]
+
+    est_duration = estimate_audio_duration(file_path)
+    if not est_duration or est_duration <= 0:
+        return None
+
+    num_chunks = -(-file_size // max_size_bytes)  # ceil division
+    segment_duration = int(est_duration / num_chunks)
+    if segment_duration < 10:
+        return None
+
+    ext = Path(file_path).suffix
+    tmp_dir = tempfile.mkdtemp(prefix="stt_chunks_")
+    output_pattern = os.path.join(tmp_dir, f"chunk_%03d{ext}")
+
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg, "-i", file_path,
+                "-f", "segment",
+                "-segment_time", str(segment_duration),
+                "-c", "copy",
+                "-y",
+                output_pattern,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            logger.warning("ffmpeg split failed: %s", result.stderr[:300])
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+
+        chunks = sorted(str(p) for p in Path(tmp_dir).glob(f"chunk_*{ext}"))
+        if not chunks:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+
+        logger.info("Split %s into %d chunks via ffmpeg (segment ~%ds)", file_path, len(chunks), segment_duration)
+        return chunks
+    except Exception as e:
+        logger.warning("Failed to split audio with ffmpeg: %s", e)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+
+def _split_audio_native(
+    file_path: str,
+    max_size_bytes: int = _AI_BUILDER_MAX_FILE_SIZE,
+) -> Optional[List[str]]:
+    """macOS fallback: afconvert to WAV + Python wave module split.
+
+    No ffmpeg required. Uses macOS built-in afconvert for format conversion,
+    then splits the raw PCM data with Python's wave module.
+    """
+    afconvert = shutil.which("afconvert") or "/usr/bin/afconvert"
+    if not os.path.isfile(afconvert):
+        return None
+
+    tmp_dir = tempfile.mkdtemp(prefix="stt_chunks_")
+    wav_path = os.path.join(tmp_dir, "converted.wav")
+
+    try:
+        # Convert to 16kHz mono 16-bit WAV
+        result = subprocess.run(
+            [afconvert, "-f", "WAVE", "-d", "LEI16@16000", "-c", "1",
+             file_path, wav_path],
+            capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode != 0:
+            logger.warning("afconvert failed: %s", result.stderr[:300])
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+
+        # Split WAV by frame count
+        with wave.open(wav_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            frame_rate = wf.getframerate()
+            total_frames = wf.getnframes()
+            bytes_per_frame = n_channels * sample_width
+
+            # leave room for 44-byte WAV header
+            frames_per_chunk = (max_size_bytes - 44) // bytes_per_frame
+
+            chunks: List[str] = []
+            frames_read = 0
+            while frames_read < total_frames:
+                n = min(frames_per_chunk, total_frames - frames_read)
+                data = wf.readframes(n)
+                frames_read += n
+
+                chunk_path = os.path.join(tmp_dir, f"chunk_{len(chunks):03d}.wav")
+                with wave.open(chunk_path, "wb") as cw:
+                    cw.setnchannels(n_channels)
+                    cw.setsampwidth(sample_width)
+                    cw.setframerate(frame_rate)
+                    cw.writeframes(data)
+                chunks.append(chunk_path)
+
+        os.unlink(wav_path)
+
+        if not chunks:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return None
+
+        logger.info(
+            "Split %s into %d WAV chunks via afconvert (16kHz mono)",
+            file_path, len(chunks),
+        )
+        return chunks
+    except Exception as e:
+        logger.warning("Native audio split failed: %s", e)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+
+def _split_audio(
+    file_path: str,
+    max_size_bytes: int = _AI_BUILDER_MAX_FILE_SIZE,
+) -> Optional[List[str]]:
+    """Split audio, trying ffmpeg first, then macOS native fallback."""
+    file_size = os.path.getsize(file_path)
+    if file_size <= max_size_bytes:
+        return [file_path]
+
+    chunks = _split_audio_ffmpeg(file_path, max_size_bytes)
+    if chunks:
+        return chunks
+
+    logger.info("ffmpeg unavailable, trying macOS native split (afconvert)...")
+    chunks = _split_audio_native(file_path, max_size_bytes)
+    if chunks:
+        return chunks
+
+    logger.error(
+        "Cannot split audio: install ffmpeg (`pip install imageio-ffmpeg` "
+        "or `brew install ffmpeg`) or set GEMINI_API_KEY for large-file fallback"
+    )
+    return None
+
+
+def _transcribe_chunked(
+    file_path: str,
+    api_key: str,
+    api_base: str,
+    language: Optional[str],
+    gemini_api_key: Optional[str],
+) -> Optional[TranscriptionResult]:
+    """Split a large file into chunks and transcribe each one."""
+    chunks = _split_audio(file_path)
+    if not chunks:
+        return None
+
+    tmp_dir = str(Path(chunks[0]).parent) if chunks[0] != file_path else None
+    try:
+        texts = []
+        for i, chunk_path in enumerate(chunks):
+            logger.info("Transcribing chunk %d/%d: %s", i + 1, len(chunks), chunk_path)
+            result = transcribe_file_with_retry(
+                file_path=chunk_path,
+                api_key=api_key,
+                api_base=api_base,
+                language=language,
+                max_retries=1,
+                force_long=None,
+                gemini_api_key=gemini_api_key,
+            )
+            if not result.success:
+                logger.error("Chunk %d failed: %s", i + 1, result.error)
+                return TranscriptionResult(
+                    file_path=file_path,
+                    success=False,
+                    error=f"Chunk {i+1}/{len(chunks)} failed: {result.error}",
+                    used_long_endpoint=True,
+                )
+            texts.append(result.text or "")
+
+        combined = "\n".join(texts)
+        logger.info("Chunked transcription succeeded (%d chunks)", len(chunks))
+        return TranscriptionResult(
+            file_path=file_path,
+            success=True,
+            text=combined,
+            used_long_endpoint=True,
+        )
+    finally:
+        if tmp_dir and tmp_dir != str(Path(file_path).parent):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def transcribe_file_with_retry(
     file_path: str,
     api_key: str,
@@ -393,12 +630,23 @@ def transcribe_file_with_retry(
             last_error = str(e)
             logger.warning(f"Attempt {attempts} failed for {file_path}: {last_error}")
 
+            if _is_payload_too_large(last_error):
+                break  # 413 won't resolve with retries
+
             if attempts > max_retries:
                 break
 
-    # Gemini fallback: only on timeout errors when gemini_api_key is available
-    if gemini_api_key and _GEMINI_AVAILABLE and _is_timeout_error(last_error or ""):
-        logger.info("AI Builder retries exhausted (timeout), attempting Gemini fallback...")
+    # 413 fallback: split with ffmpeg then transcribe chunks
+    if _is_payload_too_large(last_error or ""):
+        logger.info("File too large for API, attempting chunked transcription...")
+        chunked = _transcribe_chunked(file_path, api_key, api_base, language, gemini_api_key)
+        if chunked is not None:
+            return chunked
+
+    # Gemini fallback: on timeout OR 413 (when chunking unavailable)
+    should_try_gemini = _is_timeout_error(last_error or "") or _is_payload_too_large(last_error or "")
+    if gemini_api_key and _GEMINI_AVAILABLE and should_try_gemini:
+        logger.info("Attempting Gemini fallback...")
         try:
             text = _transcribe_with_gemini(file_path, gemini_api_key, language)
             logger.info(f"Gemini fallback succeeded for {file_path}")

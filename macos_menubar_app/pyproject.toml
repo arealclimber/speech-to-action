@@ -1,0 +1,22 @@
+[project]
+name = "speech-to-action"
+version = "0.1.0"
+description = "macOS menubar app for voice-to-text with auto-paste"
+requires-python = ">=3.10"
+dependencies = [
+    "rumps>=0.4.0",
+    "pyobjc-framework-Cocoa>=10.0",
+    "pyobjc-framework-ApplicationServices>=10.0",
+    "pyobjc-framework-Quartz>=10.0",
+    "sounddevice>=0.4.6",
+    "numpy>=1.24.0",
+    "openai>=1.0.0",
+    "pyperclip>=1.8.2",
+    "scipy>=1.11.0",
+    "pynput>=1.7.6",
+    "opencc-python-reimplemented>=0.1.7",
+    "google-genai>=1.0.0",
+]
+
+[project.scripts]
+speech-to-action = "speech_to_clipboard:main"

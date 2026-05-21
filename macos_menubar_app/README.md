@@ -5,14 +5,7 @@ Get running in 2 minutes.
 ## Setup
 
 ```bash
-# 1. Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Set API key (choose one)
+# 1. Set API key (choose one)
 
 # Option A: OpenAI Whisper
 export OPENAI_API_KEY='your-openai-api-key'
@@ -22,8 +15,8 @@ export AI_BUILDER_API_KEY='your-ai-builder-api-key'
 # Or add to ~/.zshrc:
 #   export AI_BUILDER_API_KEY='your-ai-builder-api-key'
 
-# 4. Run app
-python3 speech_to_clipboard.py
+# 2. Run app (uv auto-installs dependencies)
+uv run speech_to_clipboard.py
 ```
 
 If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app uses **AI Builder** transcription (`https://space.ai-builders.com/backend/v1/audio/transcriptions`); otherwise it uses **OpenAI** Whisper.
@@ -93,9 +86,9 @@ Results:
 **No menubar icon?**
 
 - Set at least one of `OPENAI_API_KEY` or `AI_BUILDER_API_KEY` (e.g. in `~/.zshrc`)
-- Run `python3 speech_to_clipboard.py` in terminal to see errors
+- Run `uv run speech_to_clipboard.py` in terminal to see errors
 
 **Recording doesn't start?**
 
 - Check Microphone permission granted
-- Test with `python3 test_auto_paste.py`
+- Test with `uv run test_auto_paste.py`
