@@ -229,19 +229,27 @@ class SpeechToClipboardApp(rumps.App):
         self.checkpoint_save_dir = None
         self.checkpoint_last_chunk_idx = 0
         self.checkpoint_seg_count = 0
+        self.checkpoint_md_path = None
+        self.checkpoint_md_lock = threading.Lock()
+
+        # OpenAI 單檔轉錄 session 的 markdown log（lazy 建立、整個 app session 共用）
+        self.openai_session_md_path = None
+        self.openai_session_md_lock = threading.Lock()
 
         # 設置菜單
         self.menu = [
             rumps.MenuItem("開始錄音 (⌃⌥R)", callback=self.toggle_recording, key="a"),
+            rumps.MenuItem("錄音並送出 (⌃⌥E)", callback=self.toggle_transcribe_and_send_recording),
             rumps.MenuItem("潤飾語音 (⌃⌥S)", callback=self.toggle_refine_recording),
-            rumps.MenuItem("Checkpoint 錄音 (⌃⌥X)", callback=self.toggle_checkpoint_recording_menu),
-            rumps.MenuItem("標記 Checkpoint (⌃⌥Z)", callback=self.mark_checkpoint_menu),
+            rumps.MenuItem("Checkpoint 錄音 (⌃⌥Q)", callback=self.toggle_checkpoint_recording_menu),
+            rumps.MenuItem("標記 Checkpoint (⌃⌥W)", callback=self.mark_checkpoint_menu),
             rumps.separator,
             rumps.MenuItem("錄音中...", callback=None),
             rumps.separator,
             rumps.MenuItem("最近結果"),
             rumps.separator,
             rumps.MenuItem("批次轉錄...", callback=self.batch_transcribe),
+            rumps.MenuItem("轉錄音檔 (OpenAI)...", callback=self.transcribe_audio_file),
             rumps.MenuItem("WebM 轉 MP3...", callback=self.convert_webm_to_mp3),
             rumps.separator,
             rumps.MenuItem("設定"),
@@ -314,7 +322,7 @@ class SpeechToClipboardApp(rumps.App):
         settings_menu = [
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
-            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥R/⌃⌥S/⌃⌥X/⌃⌥Z)", callback=self.toggle_global_hotkey),
+            rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥R/⌃⌥E/⌃⌥S/⌃⌥Q/⌃⌥W)", callback=self.toggle_global_hotkey),
             rumps.MenuItem(model_label, callback=None),
         ]
         self.menu["設定"] = settings_menu
@@ -339,11 +347,11 @@ class SpeechToClipboardApp(rumps.App):
         """切換全局快捷鍵功能"""
         self.global_hotkey_enabled = not self.global_hotkey_enabled
         if self.global_hotkey_enabled:
-            sender.title = "✓ 全局快捷鍵 (⌃⌥R/⌃⌥S/⌃⌥X/⌃⌥Z)"
+            sender.title = "✓ 全局快捷鍵 (⌃⌥R/⌃⌥E/⌃⌥S/⌃⌥Q/⌃⌥W)"
             self.start_global_hotkey_listener()
             logger.info("Global hotkey enabled")
         else:
-            sender.title = "全局快捷鍵 (⌃⌥R/⌃⌥S/⌃⌥X/⌃⌥Z)"
+            sender.title = "全局快捷鍵 (⌃⌥R/⌃⌥E/⌃⌥S/⌃⌥Q/⌃⌥W)"
             self.stop_global_hotkey_listener()
             logger.info("Global hotkey disabled")
 
@@ -361,16 +369,20 @@ class SpeechToClipboardApp(rumps.App):
                 keyboard.HotKey.parse('<ctrl>+<alt>+r'),
                 self.on_hotkey_pressed
             )
+            hotkey_transcribe_send = keyboard.HotKey(
+                keyboard.HotKey.parse('<ctrl>+<alt>+e'),
+                self.on_transcribe_and_send_hotkey_pressed
+            )
             hotkey_refine = keyboard.HotKey(
                 keyboard.HotKey.parse('<ctrl>+<alt>+s'),
                 self.on_refine_hotkey_pressed
             )
             hotkey_checkpoint_toggle = keyboard.HotKey(
-                keyboard.HotKey.parse('<ctrl>+<alt>+x'),
+                keyboard.HotKey.parse('<ctrl>+<alt>+q'),
                 self.on_checkpoint_toggle_hotkey
             )
             hotkey_checkpoint_mark = keyboard.HotKey(
-                keyboard.HotKey.parse('<ctrl>+<alt>+z'),
+                keyboard.HotKey.parse('<ctrl>+<alt>+w'),
                 self.on_checkpoint_mark_hotkey
             )
 
@@ -378,12 +390,14 @@ class SpeechToClipboardApp(rumps.App):
             self.hotkey_listener = keyboard.Listener(
                 on_press=lambda key: (
                     hotkey_transcribe.press(self.hotkey_listener.canonical(key)),
+                    hotkey_transcribe_send.press(self.hotkey_listener.canonical(key)),
                     hotkey_refine.press(self.hotkey_listener.canonical(key)),
                     hotkey_checkpoint_toggle.press(self.hotkey_listener.canonical(key)),
                     hotkey_checkpoint_mark.press(self.hotkey_listener.canonical(key)),
                 ),
                 on_release=lambda key: (
                     hotkey_transcribe.release(self.hotkey_listener.canonical(key)),
+                    hotkey_transcribe_send.release(self.hotkey_listener.canonical(key)),
                     hotkey_refine.release(self.hotkey_listener.canonical(key)),
                     hotkey_checkpoint_toggle.release(self.hotkey_listener.canonical(key)),
                     hotkey_checkpoint_mark.release(self.hotkey_listener.canonical(key)),
@@ -392,7 +406,7 @@ class SpeechToClipboardApp(rumps.App):
 
             # 啟動監聽器（在後台線程運行）
             self.hotkey_listener.start()
-            logger.info("Global hotkey listener started (⌃⌥R: transcribe, ⌃⌥S: refine, ⌃⌥X: checkpoint, ⌃⌥Z: mark)")
+            logger.info("Global hotkey listener started (⌃⌥R: transcribe, ⌃⌥E: transcribe+send, ⌃⌥S: refine, ⌃⌥Q: checkpoint, ⌃⌥W: mark)")
 
         except Exception as e:
             logger.error(f"Failed to start global hotkey listener: {e}")
@@ -416,8 +430,8 @@ class SpeechToClipboardApp(rumps.App):
         """全局快捷鍵被按下的回調（⌃⌥R 語音轉文字）"""
         logger.info("Global hotkey pressed (Control+Option+R)")
         if self.checkpoint_mode:
-            logger.warning("⌃⌥R ignored: checkpoint mode is active (use ⌃⌥X to stop first)")
-            rumps.notification("Checkpoint 模式進行中", "請先按 ⌃⌥X 結束 checkpoint 錄音", "")
+            logger.warning("⌃⌥R ignored: checkpoint mode is active (use ⌃⌥Q to stop first)")
+            rumps.notification("Checkpoint 模式進行中", "請先按 ⌃⌥Q 結束 checkpoint 錄音", "")
             return
         if not self.recording:
             self.recording_mode = "transcribe"
@@ -427,11 +441,22 @@ class SpeechToClipboardApp(rumps.App):
         """潤飾快捷鍵被按下的回調（⌃⌥S 語音潤飾）"""
         logger.info("Refine hotkey pressed (Control+Option+S)")
         if self.checkpoint_mode:
-            logger.warning("⌃⌥S ignored: checkpoint mode is active (use ⌃⌥X to stop first)")
-            rumps.notification("Checkpoint 模式進行中", "請先按 ⌃⌥X 結束 checkpoint 錄音", "")
+            logger.warning("⌃⌥S ignored: checkpoint mode is active (use ⌃⌥Q to stop first)")
+            rumps.notification("Checkpoint 模式進行中", "請先按 ⌃⌥Q 結束 checkpoint 錄音", "")
             return
         if not self.recording:
             self.recording_mode = "refine"
+        self.toggle_recording(None)
+
+    def on_transcribe_and_send_hotkey_pressed(self):
+        """轉錄＋送出 快捷鍵被按下的回調（⌃⌥E：轉錄完文字後自動按 Enter）"""
+        logger.info("Transcribe-and-send hotkey pressed (Control+Option+E)")
+        if self.checkpoint_mode:
+            logger.warning("⌃⌥E ignored: checkpoint mode is active (use ⌃⌥Q to stop first)")
+            rumps.notification("Checkpoint 模式進行中", "請先按 ⌃⌥Q 結束 checkpoint 錄音", "")
+            return
+        if not self.recording:
+            self.recording_mode = "transcribe_and_send"
         self.toggle_recording(None)
 
     def toggle_refine_recording(self, sender):
@@ -440,24 +465,30 @@ class SpeechToClipboardApp(rumps.App):
             self.recording_mode = "refine"
         self.toggle_recording(sender)
 
+    def toggle_transcribe_and_send_recording(self, sender):
+        """從菜單觸發 轉錄＋送出 錄音"""
+        if not self.recording:
+            self.recording_mode = "transcribe_and_send"
+        self.toggle_recording(sender)
+
     # ------------------------------------------------------------------
-    # Checkpoint recording mode (⌃⌥X start/stop, ⌃⌥Z mark checkpoint)
+    # Checkpoint recording mode (⌃⌥Q start/stop, ⌃⌥W mark checkpoint)
     # ------------------------------------------------------------------
 
     def on_checkpoint_toggle_hotkey(self):
-        """⌃⌥X 開始/結束 checkpoint 錄音模式"""
-        logger.info("Checkpoint toggle hotkey pressed (Control+Option+X)")
+        """⌃⌥Q 開始/結束 checkpoint 錄音模式"""
+        logger.info("Checkpoint toggle hotkey pressed (Control+Option+Q)")
         if self.checkpoint_mode:
             self.stop_checkpoint_recording()
         else:
             self.start_checkpoint_recording()
 
     def on_checkpoint_mark_hotkey(self):
-        """⌃⌥Z 在 checkpoint 錄音中標記一個 checkpoint，把上次到現在這段轉文字"""
-        logger.info("Checkpoint mark hotkey pressed (Control+Option+Z)")
+        """⌃⌥W 在 checkpoint 錄音中標記一個 checkpoint，把上次到現在這段轉文字"""
+        logger.info("Checkpoint mark hotkey pressed (Control+Option+W)")
         if not self.checkpoint_mode:
-            logger.warning("⌃⌥Z pressed but not in checkpoint mode — ignored")
-            rumps.notification("Checkpoint 模式未開啟", "請先按 ⌃⌥X 開始 checkpoint 錄音", "")
+            logger.warning("⌃⌥W pressed but not in checkpoint mode — ignored")
+            rumps.notification("Checkpoint 模式未開啟", "請先按 ⌃⌥Q 開始 checkpoint 錄音", "")
             return
         self.mark_checkpoint()
 
@@ -493,6 +524,23 @@ class SpeechToClipboardApp(rumps.App):
         self.checkpoint_seg_count = 0
         self.recording_mode = "checkpoint"
 
+        # 建立 Markdown log 並用系統預設 app 開啟
+        md_filename = f"checkpoint_{session_id}.md"
+        md_path = os.path.join(save_dir, md_filename)
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(f"# Checkpoint Session {session_id}\n\n")
+                f.write(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            self.checkpoint_md_path = md_path
+            logger.info(f"[Checkpoint MD created] path={md_path}")
+            try:
+                subprocess.Popen(["open", md_path])
+            except Exception as e:
+                logger.warning(f"Failed to `open` markdown file: {e}")
+        except OSError as e:
+            logger.error(f"Failed to create checkpoint MD file: {e}")
+            self.checkpoint_md_path = None
+
         logger.info(f"Checkpoint recording session started: id={session_id}, save_dir={save_dir}")
 
         # 重用既有錄音 infra
@@ -506,7 +554,7 @@ class SpeechToClipboardApp(rumps.App):
                 break
 
         self.title = "⏺"
-        self.menu["Checkpoint 錄音 (⌃⌥X)"].title = "停止 Checkpoint 錄音 (⌃⌥X)"
+        self.menu["Checkpoint 錄音 (⌃⌥Q)"].title = "停止 Checkpoint 錄音 (⌃⌥Q)"
         self.menu["錄音中..."].state = True
 
         self.recording_thread = threading.Thread(target=self._record_audio, daemon=True)
@@ -515,7 +563,7 @@ class SpeechToClipboardApp(rumps.App):
         rumps.notification(
             "Checkpoint 錄音開始",
             f"Session: {session_id}",
-            f"按 ⌃⌥Z 標記 checkpoint，再按 ⌃⌥X 結束"
+            f"按 ⌃⌥W 標記 checkpoint，再按 ⌃⌥Q 結束"
         )
 
     def mark_checkpoint(self):
@@ -532,12 +580,13 @@ class SpeechToClipboardApp(rumps.App):
 
         self.checkpoint_seg_count += 1
         seg_idx = self.checkpoint_seg_count
-        logger.info(f"Checkpoint #{seg_idx} marked: {len(segment_chunks)} new audio chunks")
+        mark_time = time.strftime("%H:%M:%S")
+        logger.info(f"Checkpoint #{seg_idx} marked at {mark_time}: {len(segment_chunks)} new audio chunks")
 
         # 在背景轉錄這段 segment
         threading.Thread(
             target=self._process_checkpoint_segment,
-            args=(segment_chunks, seg_idx, False, self.checkpoint_session_id, self.checkpoint_save_dir),
+            args=(segment_chunks, seg_idx, False, self.checkpoint_session_id, self.checkpoint_save_dir, None, self.checkpoint_md_path, mark_time),
             daemon=True,
         ).start()
 
@@ -549,7 +598,7 @@ class SpeechToClipboardApp(rumps.App):
         logger.info("Stopping checkpoint recording session...")
         self.recording = False
         self.title = "🔄"
-        self.menu["Checkpoint 錄音 (⌃⌥X)"].title = "處理中..."
+        self.menu["Checkpoint 錄音 (⌃⌥Q)"].title = "處理中..."
         self.menu["錄音中..."].state = False
 
         if self.recording_thread and self.recording_thread.is_alive():
@@ -573,10 +622,11 @@ class SpeechToClipboardApp(rumps.App):
         if final_chunks:
             self.checkpoint_seg_count += 1
             seg_idx = self.checkpoint_seg_count
-            logger.info(f"Final checkpoint #{seg_idx}: {len(final_chunks)} chunks")
+            mark_time = time.strftime("%H:%M:%S")
+            logger.info(f"Final checkpoint #{seg_idx} at {mark_time}: {len(final_chunks)} chunks")
             threading.Thread(
                 target=self._process_checkpoint_segment,
-                args=(final_chunks, seg_idx, True, self.checkpoint_session_id, self.checkpoint_save_dir, full_path),
+                args=(final_chunks, seg_idx, True, self.checkpoint_session_id, self.checkpoint_save_dir, full_path, self.checkpoint_md_path, mark_time),
                 daemon=True,
             ).start()
         else:
@@ -606,7 +656,10 @@ class SpeechToClipboardApp(rumps.App):
     def _finalize_checkpoint_session(self, full_path):
         """checkpoint session 結束時 reset UI"""
         self.title = "🎤"
-        self.menu["Checkpoint 錄音 (⌃⌥X)"].title = "Checkpoint 錄音 (⌃⌥X)"
+        self.menu["Checkpoint 錄音 (⌃⌥Q)"].title = "Checkpoint 錄音 (⌃⌥Q)"
+        md_path = self.checkpoint_md_path
+        if md_path:
+            logger.info(f"[Checkpoint session ended] md={md_path}")
         notify_msg = full_path if full_path else "(無音檔)"
         rumps.notification(
             "Checkpoint 錄音結束",
@@ -618,17 +671,20 @@ class SpeechToClipboardApp(rumps.App):
         self.checkpoint_save_dir = None
         self.checkpoint_last_chunk_idx = 0
         self.checkpoint_seg_count = 0
+        self.checkpoint_md_path = None
 
-    def _process_checkpoint_segment(self, segment_chunks, seg_idx, is_final, session_id, save_dir, full_path_for_finalize=None):
-        """轉錄一個 checkpoint segment：存 WAV、log 路徑、轉文字、複製剪貼簿、自動貼上
+    def _process_checkpoint_segment(self, segment_chunks, seg_idx, is_final, session_id, save_dir, full_path_for_finalize=None, md_path=None, mark_time=None):
+        """轉錄一個 checkpoint segment：存 WAV、log 路徑、轉文字、複製剪貼簿、自動貼上、append MD
 
         Args:
             segment_chunks: 這段 segment 的 audio chunks list
             seg_idx: 第幾個 segment（1-based）
-            is_final: 是否為最後一段（⌃⌥X 觸發），決定要不要 finalize session
+            is_final: 是否為最後一段（⌃⌥Q 觸發），決定要不要 finalize session
             session_id: 此 session 的 timestamp id（call site 傳入，避免 race）
             save_dir: 此 session 的存檔目錄
             full_path_for_finalize: is_final 時用來通知顯示完整錄音路徑
+            md_path: checkpoint session Markdown log 檔案路徑（append 每段轉錄）
+            mark_time: checkpoint 被標記時的 wall-clock 時間（HH:MM:SS）。比轉錄完成時間早，能反映實際說話時間。
         """
         seg_path = None
         try:
@@ -651,19 +707,17 @@ class SpeechToClipboardApp(rumps.App):
             text = apply_manual_mappings(text, MANUAL_MAPPINGS)
             logger.info(f"[Checkpoint seg{seg_idx}] traditional: {text}")
 
-            self.copy_to_clipboard(text)
             self.recent_results.append(text)
             self.update_recent_results_menu()
 
-            pasted = False
-            if self.auto_paste_enabled:
-                pasted = self.auto_paste_to_focused_app(text)
+            # Append 到 session 的 Markdown log
+            if md_path:
+                self._append_to_checkpoint_md(md_path, text, mark_time)
 
             preview = text[:100] + "..." if len(text) > 100 else text
-            target = "已粘貼" if pasted else "已複製到剪貼板"
             rumps.notification(
                 f"Checkpoint #{seg_idx} ({provider_name})",
-                f"{target} | {os.path.basename(seg_path)}",
+                f"已寫入 MD | {os.path.basename(seg_path)}",
                 preview,
             )
 
@@ -677,6 +731,22 @@ class SpeechToClipboardApp(rumps.App):
         finally:
             if is_final:
                 self._finalize_checkpoint_session(full_path_for_finalize)
+
+    def _append_to_checkpoint_md(self, md_path, text, mark_time):
+        """把 checkpoint 轉錄結果 append 到 session MD 檔案最底下，格式 [HH:MM:SS] <text>。
+
+        Why: mark_time 由 mark_checkpoint/stop_checkpoint_recording 在按鍵當下捕捉，反映
+        真正說話的時間；若改在這裡 strftime，會晚到轉錄結束才被記下來，長音檔差距可達分鐘級。
+        """
+        timestamp = mark_time or time.strftime("%H:%M:%S")
+        block = f"[{timestamp}] {text}\n\n"
+        try:
+            with self.checkpoint_md_lock:
+                with open(md_path, "a", encoding="utf-8") as f:
+                    f.write(block)
+            logger.info(f"[Checkpoint MD appended] time={timestamp} path={md_path}")
+        except OSError as e:
+            logger.error(f"Failed to append to checkpoint MD: {e}")
 
     def change_language(self, sender):
         """更改語言設定"""
@@ -747,6 +817,21 @@ class SpeechToClipboardApp(rumps.App):
             return True
         except Exception as e:
             logger.error(f"Failed to simulate key press: {e}")
+            return False
+
+    def simulate_return_key(self):
+        """模擬按下 Return（Enter）鍵，用於 transcribe_and_send 模式自動送出"""
+        try:
+            return_keycode = 0x24  # macOS virtual keycode for Return
+            down = CGEventCreateKeyboardEvent(None, return_keycode, True)
+            up = CGEventCreateKeyboardEvent(None, return_keycode, False)
+            CGEventPost(kCGHIDEventTap, down)
+            time.sleep(0.01)
+            CGEventPost(kCGHIDEventTap, up)
+            logger.info("Simulated Return key")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to simulate Return key: {e}")
             return False
 
     def auto_paste_to_focused_app(self, text):
@@ -843,6 +928,8 @@ class SpeechToClipboardApp(rumps.App):
         self.menu["開始錄音 (⌃⌥R)"].title = "停止錄音 (⌃⌥R)"
         if self.recording_mode == "refine":
             self.menu["潤飾語音 (⌃⌥S)"].title = "⏺ 潤飾錄音中..."
+        elif self.recording_mode == "transcribe_and_send":
+            self.menu["錄音並送出 (⌃⌥E)"].title = "⏺ 送出錄音中..."
         self.menu["錄音中..."].state = True
 
         logger.info("Recording started...")
@@ -924,6 +1011,8 @@ class SpeechToClipboardApp(rumps.App):
         self.menu["開始錄音 (⌃⌥R)"].title = "處理中..."
         if self.recording_mode == "refine":
             self.menu["潤飾語音 (⌃⌥S)"].title = "處理中..."
+        elif self.recording_mode == "transcribe_and_send":
+            self.menu["錄音並送出 (⌃⌥E)"].title = "處理中..."
         self.menu["錄音中..."].state = False
 
         logger.info("Recording stopped, waiting for audio thread to finish...")
@@ -947,6 +1036,7 @@ class SpeechToClipboardApp(rumps.App):
             self.processing = False
             self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
+            self.menu["錄音並送出 (⌃⌥E)"].title = "錄音並送出 (⌃⌥E)"
             rumps.notification(
                 "語音轉文字",
                 "未錄到音頻",
@@ -1014,6 +1104,7 @@ class SpeechToClipboardApp(rumps.App):
             self.title = "🎤"
             self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
+            self.menu["錄音並送出 (⌃⌥E)"].title = "錄音並送出 (⌃⌥E)"
 
             # 複製到剪貼板（refine 模式下覆蓋為潤飾結果）
             self.copy_to_clipboard(text)
@@ -1027,17 +1118,31 @@ class SpeechToClipboardApp(rumps.App):
             if self.auto_paste_enabled:
                 pasted = self.auto_paste_to_focused_app(text)
 
+            # transcribe_and_send 模式：粘貼成功後再模擬 Enter 自動送出
+            # Why: 一些 chat UI（Slack/iMessage/ChatGPT 等）粘貼後仍需 Enter 才會送出，
+            # 因此先確保 paste 成功再 fire Return，避免 Enter 落到沒文字的輸入框觸發空送出。
+            sent = False
+            if self.recording_mode == "transcribe_and_send" and pasted:
+                time.sleep(0.05)  # 給目標 app 一點時間處理 paste 後再送 Enter
+                sent = self.simulate_return_key()
+
             # 顯示通知（含 provider 名稱）
             if self.recording_mode == "refine":
                 mode_label = "語音潤飾完成"
+            elif self.recording_mode == "transcribe_and_send":
+                mode_label = f"語音轉文字並送出（{provider_name}）"
             else:
                 mode_label = f"語音轉文字完成（{provider_name}）"
             if pasted:
                 app_info = self.get_focused_app_info()
                 app_name = app_info['name'] if app_info else "應用"
+                if self.recording_mode == "transcribe_and_send":
+                    paste_msg = f"已粘貼並送出到 {app_name}" if sent else f"已粘貼到 {app_name}（Enter 送出失敗）"
+                else:
+                    paste_msg = f"已自動粘貼到 {app_name}"
                 rumps.notification(
                     mode_label,
-                    f"已自動粘貼到 {app_name}",
+                    paste_msg,
                     text[:100] + "..." if len(text) > 100 else text
                 )
             else:
@@ -1053,6 +1158,7 @@ class SpeechToClipboardApp(rumps.App):
             self.title = "🎤"
             self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
+            self.menu["錄音並送出 (⌃⌥E)"].title = "錄音並送出 (⌃⌥E)"
 
             # 全部失敗：保存錄音到持久目錄
             if temp_path and os.path.exists(temp_path):
@@ -1598,6 +1704,168 @@ class SpeechToClipboardApp(rumps.App):
             logger.error(f"WebM conversion error: {e}", exc_info=True)
             rumps.notification("轉換錯誤", "處理失敗", str(e)[:100])
 
+    # ------------------------------------------------------------------
+    # OpenAI single-file transcription (gpt-4o-transcribe)
+    # ------------------------------------------------------------------
+
+    OPENAI_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
+    OPENAI_TRANSCRIBE_SIZE_LIMIT = 25 * 1024 * 1024
+
+    def _ensure_openai_session_md(self):
+        """第一次呼叫時建一個 session log MD 並用系統預設 app 開啟，回傳路徑。"""
+        if self.openai_session_md_path:
+            return self.openai_session_md_path
+
+        session_id = time.strftime("%Y%m%d_%H%M%S")
+        save_dir = os.path.expanduser("~/Documents/SpeechToText/openai_transcriptions")
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Failed to create OpenAI transcriptions dir: {e}")
+            return None
+
+        md_path = os.path.join(save_dir, f"openai_{session_id}.md")
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(f"# OpenAI Transcription Session {session_id}\n\n")
+                f.write(f"Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Model: {self.OPENAI_TRANSCRIBE_MODEL}\n\n")
+            self.openai_session_md_path = md_path
+            logger.info(f"[OpenAI session MD created] path={md_path}")
+        except OSError as e:
+            logger.error(f"Failed to create OpenAI session MD: {e}")
+            return None
+
+        try:
+            subprocess.Popen(["open", md_path])
+        except Exception as e:
+            logger.warning(f"Failed to `open` OpenAI session MD: {e}")
+
+        return md_path
+
+    def _append_to_openai_session_md(self, source_path: str, text: str):
+        """把一次單檔轉錄結果 append 到 session MD（lock 保護平行寫入）"""
+        md_path = self.openai_session_md_path
+        if not md_path:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        block = (
+            f"## {os.path.basename(source_path)} — {timestamp}\n\n"
+            f"`{source_path}`\n\n"
+            f"{text}\n\n"
+        )
+        try:
+            with self.openai_session_md_lock:
+                with open(md_path, "a", encoding="utf-8") as f:
+                    f.write(block)
+            logger.info(f"[OpenAI MD appended] source={source_path}")
+        except OSError as e:
+            logger.error(f"Failed to append to OpenAI session MD: {e}")
+
+    def transcribe_audio_file(self, _):
+        """選一個音檔，用 OpenAI 最新 STT 模型轉錄"""
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if not openai_key:
+            rumps.alert(
+                "需要 OpenAI API Key",
+                "此功能需要直連 OpenAI，請設置 OPENAI_API_KEY"
+            )
+            return
+
+        response = rumps.Window(
+            f"轉錄音檔 ({self.OPENAI_TRANSCRIBE_MODEL})",
+            "請輸入音檔路徑 (支援 mp3/wav/m4a/webm/flac/ogg):",
+            default_text="~/Downloads/",
+            ok="開始轉錄",
+            cancel="取消",
+            dimensions=(420, 24),
+        ).run()
+
+        if not response.clicked:
+            return
+
+        path = os.path.expanduser(response.text.strip())
+        if not path:
+            rumps.alert("錯誤", "請輸入有效的路徑")
+            return
+        if not os.path.isfile(path):
+            rumps.alert("錯誤", f"檔案不存在: {path}")
+            return
+
+        threading.Thread(
+            target=self._process_openai_file_transcription,
+            args=(path,),
+            daemon=True,
+        ).start()
+
+    def _process_openai_file_transcription(self, path: str):
+        """背景執行單檔 OpenAI 轉錄"""
+        try:
+            size = os.path.getsize(path)
+            if size > self.OPENAI_TRANSCRIBE_SIZE_LIMIT:
+                rumps.notification(
+                    "檔案過大",
+                    f"OpenAI API 限制 25MB（此檔 {size / 1024 / 1024:.1f}MB）",
+                    "請先壓縮或分段，再使用批次轉錄"
+                )
+                return
+
+            md_path = self._ensure_openai_session_md()
+
+            rumps.notification(
+                "OpenAI 轉錄",
+                f"開始處理 ({self.OPENAI_TRANSCRIBE_MODEL})",
+                f"{os.path.basename(path)} → {os.path.basename(md_path) if md_path else '(無 log)'}",
+            )
+
+            openai_key = os.getenv("OPENAI_API_KEY")
+            client = self.client if self.client else OpenAI(api_key=openai_key)
+            language = getattr(self, "language", None)
+
+            with open(path, "rb") as audio_file:
+                kwargs = {
+                    "model": self.OPENAI_TRANSCRIBE_MODEL,
+                    "file": audio_file,
+                }
+                if language:
+                    kwargs["language"] = language
+                transcript = client.audio.transcriptions.create(**kwargs)
+
+            text = transcript.text or ""
+            text = self.cc.convert(text)
+            text = apply_manual_mappings(text, MANUAL_MAPPINGS)
+
+            from pathlib import Path
+            txt_path = Path(path).with_suffix(".txt")
+            try:
+                txt_path.write_text(text, encoding="utf-8")
+            except OSError as e:
+                logger.error(f"Failed to save txt: {e}")
+                txt_path = None
+
+            self.copy_to_clipboard(text)
+            self.recent_results.append(text)
+            self.update_recent_results_menu()
+
+            self._append_to_openai_session_md(path, text)
+
+            preview = text[:100] + "..." if len(text) > 100 else text
+            saved_msg = f"已存 {txt_path.name}" if txt_path else "(txt 寫入失敗)"
+            md_msg = f" | append→{os.path.basename(self.openai_session_md_path)}" if self.openai_session_md_path else ""
+            rumps.notification(
+                f"轉錄完成 ({self.OPENAI_TRANSCRIBE_MODEL})",
+                f"已複製到剪貼板 | {saved_msg}{md_msg}",
+                preview,
+            )
+            logger.info(
+                f"[OpenAI file transcription done] file={path} chars={len(text)} "
+                f"txt={txt_path} session_md={self.openai_session_md_path}"
+            )
+
+        except Exception as e:
+            logger.error(f"OpenAI file transcription error: {e}", exc_info=True)
+            rumps.notification("轉錄失敗", "OpenAI API 呼叫失敗", str(e)[:100])
+
     @rumps.clicked("關於")
     def about(self, _):
         """顯示關於信息"""
@@ -1607,14 +1875,16 @@ class SpeechToClipboardApp(rumps.App):
             "使用 OpenAI Whisper API 進行語音識別\n\n"
             "快捷鍵:\n"
             "  ⌃⌥R - 語音轉文字\n"
+            "  ⌃⌥E - 語音轉文字並自動送出（粘貼後按 Enter）\n"
             "  ⌃⌥S - 語音潤飾（轉文字＋LLM 潤飾）\n"
-            "  ⌃⌥X - Checkpoint 錄音開始/結束（長錄音）\n"
-            "  ⌃⌥Z - 在 checkpoint 錄音中標記一段轉文字\n"
+            "  ⌃⌥Q - Checkpoint 錄音開始/結束（長錄音）\n"
+            "  ⌃⌥W - 在 checkpoint 錄音中標記一段轉文字\n"
             "  ⌘A - 菜單快捷鍵（需打開菜單）\n\n"
             "功能:\n"
             "  • 語音轉文字\n"
             "  • 語音潤飾（AI 修飾口語）\n"
             "  • Checkpoint 模式（持續錄音，分段即時轉文字）\n"
+            "  • 轉錄音檔（OpenAI gpt-4o-transcribe）\n"
             "  • 自動粘貼到焦點應用\n"
             "  • 全局快捷鍵\n\n"
             "© 2025"

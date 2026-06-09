@@ -33,16 +33,28 @@ If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app 
 2. **Look for 🎤** in menubar (top right)
 
 3. **Test it**:
-   - Press `⌃⌥A` anywhere
+   - Press `⌃⌥R` anywhere
    - Speak into microphone
-   - Press `⌃⌥A` to stop
+   - Press `⌃⌥R` to stop
    - Text appears in focused app
+
+## Global Hotkeys
+
+| Hotkey | Mode | Behavior |
+| --- | --- | --- |
+| `⌃⌥R` | Transcribe | Record → transcribe → paste into focused app |
+| `⌃⌥E` | Transcribe & Send | Same as `⌃⌥R`, but also presses **Enter** after paste to auto-submit (chat apps, search bars, terminal) |
+| `⌃⌥S` | Refine | Record → transcribe → LLM-polish → paste |
+| `⌃⌥Q` | Checkpoint start/stop | Start a long recording session that survives multiple checkpoints; press again to end |
+| `⌃⌥W` | Checkpoint mark | While in checkpoint mode, transcribe the segment since the last mark |
+
+> `⌃⌥E` only fires Enter when auto-paste actually succeeds, so it won't accidentally submit an empty input if the target app isn't ready.
 
 ### Terminal Commands
 
 1. Focus Terminal
-2. Press `⌃⌥A` → speak command → `⌃⌥A`
-3. Command appears in terminal
+2. Press `⌃⌥R` → speak command → `⌃⌥R`
+3. Command appears in terminal (use `⌃⌥E` instead to run it immediately)
 
 ### Batch Transcription
 
