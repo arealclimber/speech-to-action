@@ -239,7 +239,7 @@ class SpeechToClipboardApp(rumps.App):
         # 設置菜單
         self.menu = [
             rumps.MenuItem("開始錄音 (⌃⌥R)", callback=self.toggle_recording, key="a"),
-            rumps.MenuItem("錄音並送出 (⌃⌥E)", callback=self.toggle_transcribe_and_send_recording),
+            rumps.MenuItem("停止並送出 (⌃⌥E)", callback=self.toggle_transcribe_and_send_recording),
             rumps.MenuItem("潤飾語音 (⌃⌥S)", callback=self.toggle_refine_recording),
             rumps.MenuItem("Checkpoint 錄音 (⌃⌥Q)", callback=self.toggle_checkpoint_recording_menu),
             rumps.MenuItem("標記 Checkpoint (⌃⌥W)", callback=self.mark_checkpoint_menu),
@@ -406,7 +406,7 @@ class SpeechToClipboardApp(rumps.App):
 
             # 啟動監聽器（在後台線程運行）
             self.hotkey_listener.start()
-            logger.info("Global hotkey listener started (⌃⌥R: transcribe, ⌃⌥E: transcribe+send, ⌃⌥S: refine, ⌃⌥Q: checkpoint, ⌃⌥W: mark)")
+            logger.info("Global hotkey listener started (⌃⌥R: start/stop transcribe, ⌃⌥E: stop+send, ⌃⌥S: refine, ⌃⌥Q: checkpoint, ⌃⌥W: mark)")
 
         except Exception as e:
             logger.error(f"Failed to start global hotkey listener: {e}")
@@ -449,14 +449,25 @@ class SpeechToClipboardApp(rumps.App):
         self.toggle_recording(None)
 
     def on_transcribe_and_send_hotkey_pressed(self):
-        """轉錄＋送出 快捷鍵被按下的回調（⌃⌥E：轉錄完文字後自動按 Enter）"""
+        """⌃⌥E：stop-with-send terminator。
+
+        新邏輯：錄音永遠用 ⌃⌥R 起頭，⌃⌥E 只在錄音進行中作用，按下即停止並把 mode 切成
+        transcribe_and_send，讓 _process_audio 在 paste 後自動 fire Enter 送出。
+        當沒有錄音時按 ⌃⌥E 不會啟動錄音（避免改變「start 永遠是 ⌃⌥R」的約定）。
+        """
         logger.info("Transcribe-and-send hotkey pressed (Control+Option+E)")
         if self.checkpoint_mode:
             logger.warning("⌃⌥E ignored: checkpoint mode is active (use ⌃⌥Q to stop first)")
             rumps.notification("Checkpoint 模式進行中", "請先按 ⌃⌥Q 結束 checkpoint 錄音", "")
             return
         if not self.recording:
-            self.recording_mode = "transcribe_and_send"
+            logger.info("⌃⌥E ignored: no active recording — use ⌃⌥R to start recording first")
+            rumps.notification("尚未錄音", "請先用 ⌃⌥R 開始錄音", "⌃⌥E 只用於結束錄音並送出")
+            return
+        if self.processing:
+            return
+        # 切換到送出模式後停止
+        self.recording_mode = "transcribe_and_send"
         self.toggle_recording(None)
 
     def toggle_refine_recording(self, sender):
@@ -466,10 +477,9 @@ class SpeechToClipboardApp(rumps.App):
         self.toggle_recording(sender)
 
     def toggle_transcribe_and_send_recording(self, sender):
-        """從菜單觸發 轉錄＋送出 錄音"""
-        if not self.recording:
-            self.recording_mode = "transcribe_and_send"
-        self.toggle_recording(sender)
+        """從菜單觸發 停止並送出。同 on_transcribe_and_send_hotkey_pressed：
+        只有在錄音中才作用，並切換 mode 後停止；未錄音時不啟動。"""
+        self.on_transcribe_and_send_hotkey_pressed()
 
     # ------------------------------------------------------------------
     # Checkpoint recording mode (⌃⌥Q start/stop, ⌃⌥W mark checkpoint)
@@ -928,8 +938,8 @@ class SpeechToClipboardApp(rumps.App):
         self.menu["開始錄音 (⌃⌥R)"].title = "停止錄音 (⌃⌥R)"
         if self.recording_mode == "refine":
             self.menu["潤飾語音 (⌃⌥S)"].title = "⏺ 潤飾錄音中..."
-        elif self.recording_mode == "transcribe_and_send":
-            self.menu["錄音並送出 (⌃⌥E)"].title = "⏺ 送出錄音中..."
+        # 錄音中時，⌃⌥E 才有意義：把 menu 提示成「按 ⌃⌥E 停止並送出」
+        self.menu["停止並送出 (⌃⌥E)"].title = "停止並送出 (⌃⌥E)"
         self.menu["錄音中..."].state = True
 
         logger.info("Recording started...")
@@ -1012,7 +1022,7 @@ class SpeechToClipboardApp(rumps.App):
         if self.recording_mode == "refine":
             self.menu["潤飾語音 (⌃⌥S)"].title = "處理中..."
         elif self.recording_mode == "transcribe_and_send":
-            self.menu["錄音並送出 (⌃⌥E)"].title = "處理中..."
+            self.menu["停止並送出 (⌃⌥E)"].title = "處理中..."
         self.menu["錄音中..."].state = False
 
         logger.info("Recording stopped, waiting for audio thread to finish...")
@@ -1036,7 +1046,7 @@ class SpeechToClipboardApp(rumps.App):
             self.processing = False
             self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
-            self.menu["錄音並送出 (⌃⌥E)"].title = "錄音並送出 (⌃⌥E)"
+            self.menu["停止並送出 (⌃⌥E)"].title = "停止並送出 (⌃⌥E)"
             rumps.notification(
                 "語音轉文字",
                 "未錄到音頻",
@@ -1104,7 +1114,7 @@ class SpeechToClipboardApp(rumps.App):
             self.title = "🎤"
             self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
-            self.menu["錄音並送出 (⌃⌥E)"].title = "錄音並送出 (⌃⌥E)"
+            self.menu["停止並送出 (⌃⌥E)"].title = "停止並送出 (⌃⌥E)"
 
             # 複製到剪貼板（refine 模式下覆蓋為潤飾結果）
             self.copy_to_clipboard(text)
@@ -1158,7 +1168,7 @@ class SpeechToClipboardApp(rumps.App):
             self.title = "🎤"
             self.menu["開始錄音 (⌃⌥R)"].title = "開始錄音 (⌃⌥R)"
             self.menu["潤飾語音 (⌃⌥S)"].title = "潤飾語音 (⌃⌥S)"
-            self.menu["錄音並送出 (⌃⌥E)"].title = "錄音並送出 (⌃⌥E)"
+            self.menu["停止並送出 (⌃⌥E)"].title = "停止並送出 (⌃⌥E)"
 
             # 全部失敗：保存錄音到持久目錄
             if temp_path and os.path.exists(temp_path):
@@ -1874,8 +1884,8 @@ class SpeechToClipboardApp(rumps.App):
             "一個簡單的 macOS 狀態列應用\n"
             "使用 OpenAI Whisper API 進行語音識別\n\n"
             "快捷鍵:\n"
-            "  ⌃⌥R - 語音轉文字\n"
-            "  ⌃⌥E - 語音轉文字並自動送出（粘貼後按 Enter）\n"
+            "  ⌃⌥R - 開始錄音；再按一次停止並只轉文字\n"
+            "  ⌃⌥E - （錄音中按）停止錄音、轉文字後自動按 Enter 送出\n"
             "  ⌃⌥S - 語音潤飾（轉文字＋LLM 潤飾）\n"
             "  ⌃⌥Q - Checkpoint 錄音開始/結束（長錄音）\n"
             "  ⌃⌥W - 在 checkpoint 錄音中標記一段轉文字\n"

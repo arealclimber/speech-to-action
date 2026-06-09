@@ -24,7 +24,6 @@ If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app 
 ## First Use
 
 1. **Grant permissions** when prompted:
-
    - Microphone (required)
    - Accessibility (for global hotkey + auto-paste)
 
@@ -40,21 +39,23 @@ If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app 
 
 ## Global Hotkeys
 
-| Hotkey | Mode | Behavior |
-| --- | --- | --- |
-| `⌃⌥R` | Transcribe | Record → transcribe → paste into focused app |
-| `⌃⌥E` | Transcribe & Send | Same as `⌃⌥R`, but also presses **Enter** after paste to auto-submit (chat apps, search bars, terminal) |
-| `⌃⌥S` | Refine | Record → transcribe → LLM-polish → paste |
-| `⌃⌥Q` | Checkpoint start/stop | Start a long recording session that survives multiple checkpoints; press again to end |
-| `⌃⌥W` | Checkpoint mark | While in checkpoint mode, transcribe the segment since the last mark |
+**Recording always starts with `⌃⌥R`. The hotkey you press to _stop_ decides what happens after transcription:**
 
-> `⌃⌥E` only fires Enter when auto-paste actually succeeds, so it won't accidentally submit an empty input if the target app isn't ready.
+| Hotkey | Role                           | Behavior                                                                                                                                                                      |
+| ------ | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `⌃⌥R`  | Start / stop (transcribe only) | First press starts recording. Press again to stop → transcribe → paste into focused app.                                                                                      |
+| `⌃⌥E`  | Stop & send                    | Only meaningful **while already recording**. Stops the active `⌃⌥R` recording, transcribes, pastes, then presses **Enter** to auto-submit (chat apps, search bars, terminal). |
+| `⌃⌥S`  | Refine                         | Record → transcribe → LLM-polish → paste.                                                                                                                                     |
+| `⌃⌥Q`  | Checkpoint start/stop          | Start a long recording session that survives multiple checkpoints; press again to end.                                                                                        |
+| `⌃⌥W`  | Checkpoint mark                | While in checkpoint mode, transcribe the segment since the last mark.                                                                                                         |
+
+> `⌃⌥E` does nothing if no recording is active — start with `⌃⌥R` first, then decide at stop-time whether to end with `⌃⌥R` (no submit) or `⌃⌥E` (auto-submit). Enter is only fired when auto-paste actually succeeds, so an empty input box won't get accidentally submitted.
 
 ### Terminal Commands
 
 1. Focus Terminal
 2. Press `⌃⌥R` → speak command → `⌃⌥R`
-3. Command appears in terminal (use `⌃⌥E` instead to run it immediately)
+3. Command appears in terminal (end with `⌃⌥E` instead to run it immediately)
 
 ### Batch Transcription
 
@@ -70,6 +71,7 @@ Process multiple audio files at once:
    - Show summary notification
 
 **Example:**
+
 ```
 Directory: ~/Downloads/recordings
 Files: audio1.wav, audio2.mp3, audio3.m4a
@@ -82,6 +84,7 @@ Results:
 ```
 
 **Features:**
+
 - Automatic retry on failure (1 retry per file)
 - Traditional Chinese output (simplified → traditional conversion)
 - Progress notifications
