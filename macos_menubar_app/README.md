@@ -19,7 +19,9 @@ export AI_BUILDER_API_KEY='your-ai-builder-api-key'
 uv run speech_to_clipboard.py
 ```
 
-If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app uses **AI Builder** transcription (`https://space.ai-builders.com/backend/v1/audio/transcriptions`); otherwise it uses **OpenAI** Whisper.
+If `AI_BUILDER_API_KEY` is set (environment variable or in `~/.zshrc`), the app uses **AI Builder** transcription (`https://space.ai-builders.com/backend/v1/audio/transcriptions`); otherwise it uses **OpenAI** Whisper. When multiple keys are set, transcription follows a cost-ordered fallback chain (AI Builder → Gemini → OpenAI).
+
+To override the chain and route **all** realtime transcription (`⌃⌥R/⌃⌥E/⌃⌥S/⌃⌥Q/⌃⌥W`) through OpenAI, toggle **設定 → 即時轉錄一律走 OpenAI** in the menubar. This toggle only appears when `OPENAI_API_KEY` is set, and resets to off on each launch.
 
 ## First Use
 

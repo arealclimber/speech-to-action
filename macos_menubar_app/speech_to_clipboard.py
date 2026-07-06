@@ -273,6 +273,9 @@ class SpeechToClipboardApp(rumps.App):
         self.global_hotkey_enabled = True
         self.hotkey_listener = None
 
+        # 強制即時轉錄一律走 OpenAI（繞過成本排序 fallback chain）
+        self.force_openai = False
+
         # 初始化設定子菜單
         self.setup_settings_menu()
 
@@ -323,8 +326,12 @@ class SpeechToClipboardApp(rumps.App):
             rumps.MenuItem("語言: 自動偵測", callback=self.change_language),
             rumps.MenuItem("✓ 自動粘貼到焦點應用", callback=self.toggle_auto_paste),
             rumps.MenuItem("✓ 全局快捷鍵 (⌃⌥R/⌃⌥E/⌃⌥S/⌃⌥Q/⌃⌥W)", callback=self.toggle_global_hotkey),
-            rumps.MenuItem(model_label, callback=None),
         ]
+        # 只有在有 OpenAI key 時，強制走 OpenAI 才有意義
+        if self.client:
+            force_title = "✓ 即時轉錄一律走 OpenAI" if self.force_openai else "即時轉錄一律走 OpenAI"
+            settings_menu.append(rumps.MenuItem(force_title, callback=self.toggle_force_openai))
+        settings_menu.append(rumps.MenuItem(model_label, callback=None))
         self.menu["設定"] = settings_menu
 
     def toggle_auto_paste(self, sender):
@@ -354,6 +361,12 @@ class SpeechToClipboardApp(rumps.App):
             sender.title = "全局快捷鍵 (⌃⌥R/⌃⌥E/⌃⌥S/⌃⌥Q/⌃⌥W)"
             self.stop_global_hotkey_listener()
             logger.info("Global hotkey disabled")
+
+    def toggle_force_openai(self, sender):
+        """切換即時轉錄是否一律走 OpenAI（繞過 fallback chain）"""
+        self.force_openai = not self.force_openai
+        sender.title = "✓ 即時轉錄一律走 OpenAI" if self.force_openai else "即時轉錄一律走 OpenAI"
+        logger.info("Force OpenAI: %s", "Enabled" if self.force_openai else "Disabled")
 
     def start_global_hotkey_listener(self):
         """啟動全局快捷鍵監聽"""
@@ -1366,6 +1379,10 @@ class SpeechToClipboardApp(rumps.App):
         Returns:
             list of (name, callable) tuples
         """
+        # 強制走 OpenAI：繞過成本排序，只用 OpenAI（含長錄音 checkpoint segment）
+        if self.force_openai and self.client:
+            return [("OpenAI", self._transcribe_openai)]
+
         chain = []
         if self.use_ai_builder:
             if use_long:
