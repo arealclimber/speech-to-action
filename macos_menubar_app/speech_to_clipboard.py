@@ -47,6 +47,10 @@ MANUAL_MAPPINGS = {
 # 超過此秒數的錄音自動使用 long transcription endpoint（AssemblyAI）
 LONG_AUDIO_DURATION_THRESHOLD = 300  # 5 分鐘
 
+# 成功轉錄後的錄音存檔目錄，改為按天數保留而非轉錄完立即刪除
+RECORDINGS_DIR = os.path.expanduser("~/Documents/SpeechToText/recordings")
+RECORDINGS_RETENTION_DAYS = 7
+
 REFINE_SYSTEM_PROMPT = (
     "你是一個文字潤飾助手。你的唯一任務是潤飾用戶提供的文字。\n"
     "規則：\n"
@@ -275,6 +279,9 @@ class SpeechToClipboardApp(rumps.App):
 
         # 強制即時轉錄一律走 OpenAI（繞過成本排序 fallback chain）
         self.force_openai = False
+
+        # 啟動時清除超過保留期的舊錄音（取代轉錄成功即刪的舊行為）
+        self._cleanup_old_recordings()
 
         # 初始化設定子菜單
         self.setup_settings_menu()
@@ -1197,12 +1204,10 @@ class SpeechToClipboardApp(rumps.App):
             self.processing = False
             logger.info("Processing completed, ready for next recording")
 
-            # 成功時清理臨時文件（失敗時已搬移）
+            # 成功時把錄音搬到持久目錄保留（失敗時已搬到 failed_recordings）
+            # 舊檔改由啟動時的 _cleanup_old_recordings() 按 7 天保留期清除
             if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception as e:
-                    logger.warning(f"Failed to delete temp file: {e}")
+                self._archive_recording(temp_path)
 
     def _save_failed_recording(self, temp_path: str):
         """將失敗的錄音保存到持久目錄，並自動清理舊檔"""
@@ -1229,6 +1234,46 @@ class SpeechToClipboardApp(rumps.App):
                     pass
         except Exception as e:
             logger.warning(f"Failed to save recording: {e}")
+
+    def _archive_recording(self, temp_path: str):
+        """成功轉錄後把錄音搬到持久目錄，之後由啟動時的保留期清理負責刪除"""
+        try:
+            import shutil
+            os.makedirs(RECORDINGS_DIR, exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(RECORDINGS_DIR, f"recording_{timestamp}.wav")
+            shutil.move(temp_path, dest)
+            logger.info(f"Recording archived to: {dest}")
+        except Exception as e:
+            # 搬移失敗時退回刪除，避免臨時檔殘留在系統暫存目錄
+            logger.warning(f"Failed to archive recording, deleting temp file instead: {e}")
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+    def _cleanup_old_recordings(self):
+        """啟動時清除超過保留期的錄音檔"""
+        try:
+            if not os.path.isdir(RECORDINGS_DIR):
+                return
+            cutoff = time.time() - RECORDINGS_RETENTION_DAYS * 86400
+            removed = 0
+            for name in os.listdir(RECORDINGS_DIR):
+                path = os.path.join(RECORDINGS_DIR, name)
+                try:
+                    if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                        os.unlink(path)
+                        removed += 1
+                except OSError:
+                    pass
+            if removed:
+                logger.info(
+                    f"Cleaned up {removed} recording(s) older than "
+                    f"{RECORDINGS_RETENTION_DAYS} days from {RECORDINGS_DIR}"
+                )
+        except Exception as e:
+            logger.warning(f"Failed to clean up old recordings: {e}")
 
     # ------------------------------------------------------------------
     # Transcription provider helpers
